@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <title>METEOR CANYON</title>
+        <meta charset="UTF-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+        />
+        <base href="" />
+        <link rel="stylesheet" href="./index.css" />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&display=swap" />
+
+        <!--
+            The viewer fills whatever contains it. In the standalone document that is the page,
+            so make the page fill the viewport. This lives here rather than in index.css because
+            a host page linking the stylesheet must not have its own body restyled.
+        -->
+        <style>
+            html,
+            body {
+                height: 100%;
+                margin: 0;
+                overflow: hidden;
+            }
+
+            /*
+                Space backdrop. settings.json clears the viewer's canvas to transparent
+                (background.color [0,0,0,0]), so this gradient shows behind the splat.
+                The canyon, the rocks and the light particles are drawn by space-fx.js / world-gl.js
+                (game.js runs the game).
+            */
+            html {
+                background: #01030b;
+            }
+            body {
+                background:
+                    radial-gradient(ellipse 75% 60% at 50% 45%, rgba(38, 78, 160, 0.42) 0%, rgba(20, 44, 110, 0.26) 40%, rgba(6, 14, 44, 0) 75%),
+                    radial-gradient(ellipse 55% 45% at 12% 88%, rgba(24, 70, 130, 0.22) 0%, rgba(24, 70, 130, 0) 70%),
+                    radial-gradient(ellipse 50% 40% at 90% 10%, rgba(40, 52, 130, 0.2) 0%, rgba(40, 52, 130, 0) 70%),
+                    linear-gradient(180deg, #050c26 0%, #08173d 45%, #040b24 78%, #01040f 100%);
+            }
+            body > .sse-viewer {
+                z-index: 1;
+            }
+        </style>
+
+        <!--
+            Single injection seam. `renderViewerHtml` replaces the contents of this block to
+            supply asset urls and inline settings, so anything generating a page around the
+            viewer goes through that function rather than pattern-matching this document.
+            Left as `null` for the standalone case.
+        -->
+        <script type="application/json" id="sse-bootstrap">{"contentUrl":"index.sog"}</script>
+
+        <script type="module">
+            const createImage = (url) => {
+                const img = new Image();
+                img.src = url;
+                return img;
+            };
+
+            const url = new URL(location.href);
+
+            // Embedder-supplied defaults. URL params take precedence over the asset urls below,
+            // so an embed can still be overridden per-instance (e.g. `?skybox=` to preview a
+            // different sky). Inline `settings` is the exception: it wins over `?settings=`, so a
+            // published experience cannot be repointed at someone else's settings file.
+            const bootstrap = JSON.parse(document.getElementById('sse-bootstrap').textContent) ?? {};
+
+            const posterUrl = url.searchParams.get('poster') ?? bootstrap.posterUrl ?? null;
+            const skyboxUrl = url.searchParams.get('skybox') ?? bootstrap.skyboxUrl ?? null;
+            const collisionUrl =
+                url.searchParams.get('collision') ?? url.searchParams.get('voxel') ?? bootstrap.collisionUrl ?? null;
+            const settingsUrl = url.searchParams.get('settings') ?? bootstrap.settingsUrl ?? './settings.json';
+            const contentUrl = url.searchParams.get('content') ?? bootstrap.contentUrl ?? './scene.compressed.ply';
+            // the bootstrap's alone: a url param would let a link run any wasm in this origin
+            const gsafDecoderUrl = bootstrap.gsafDecoderUrl ?? null;
+            const zstdDecoderUrl = bootstrap.zstdDecoderUrl ?? null;
+
+            // Names the bootstrap's contentUrl when the url itself has no usable name (a data:
+            // uri, say) — the splat format is chosen by the name's extension. Ignored when a
+            // ?content= override replaces the url it describes.
+            const contentFilename = url.searchParams.has('content') ? null : (bootstrap.contentFilename ?? null);
+
+            const renderer = url.searchParams.has('webgl') ? 'webgl' : 'webgpu';
+
+            const budgetParam = url.searchParams.get('budget');
+            const budget = budgetParam !== null ? Number(budgetParam) : undefined;
+
+            // The engine's octree and lcc2 parsers fetch lod-meta.json and .lcc2 files themselves
+            // and ignore a prefetched response, so starting one here would download the metadata
+            // twice, and the spz parser cannot read a prefetched response. Every other splat
+            // parser consumes it, so they keep the head start. `isPrefetchable` in src/index.ts
+            // applies the same rule for embedders that do not pass `contents`.
+            const contentName = (
+                contentFilename ??
+                new URL(contentUrl, location.href).pathname.split('/').pop() ??
+                ''
+            ).toLowerCase();
+            const prefetchContent =
+                contentName !== 'lod-meta.json' && !contentName.endsWith('.lcc2') && !contentName.endsWith('.spz');
+
+            // createViewer's options, minus the container and the settings. The poster image and
+            // the content fetch start here, before the module bundle has arrived.
+            const sseOptions = {
+                contentUrl,
+                contentFilename,
+                posterUrl,
+                skyboxUrl,
+                collisionUrl,
+                gsafDecoderUrl,
+                zstdDecoderUrl,
+                poster: posterUrl && createImage(posterUrl),
+                contents: prefetchContent ? fetch(contentUrl) : undefined,
+                // the game draws its own screens; ?ui brings the viewer's controls back for debugging
+                ui: url.searchParams.has('ui'),
+                reticle: url.searchParams.has('reticle'),
+                noanim: url.searchParams.has('noanim'),
+                nofx: url.searchParams.has('nofx'),
+                hpr: url.searchParams.has('hpr')
+                    ? ['', '1', 'true', 'enable'].includes(url.searchParams.get('hpr'))
+                    : undefined,
+                ministats: url.searchParams.has('ministats'),
+                colorize: url.searchParams.has('colorize'),
+                renderer,
+                aa: url.searchParams.has('aa')
+                    ? ['', '1', 'true', 'enable'].includes(url.searchParams.get('aa'))
+                    : undefined,
+                stochastic: url.searchParams.has('stochastic')
+                    ? url.searchParams.get('stochastic') === 'mobile'
+                        ? 'mobile'
+                        : url.searchParams.get('stochastic') === 'off'
+                          ? 'off'
+                          : true
+                    : false,
+                splatSource: url.searchParams.get('splatSource') ?? undefined,
+                variant: url.searchParams.get('variant') ?? undefined,
+                budget,
+                framesInFlight: url.searchParams.has('fif') ? Number(url.searchParams.get('fif')) : undefined,
+                heatmap: url.searchParams.has('heatmap'),
+                fullload: url.searchParams.has('fullload'),
+                vr: url.searchParams.has('vr'),
+                debug: url.searchParams.has('debug'),
+                lang: url.searchParams.get('lang'),
+                // the standalone document is the one place the window.* hooks belong
+                exposeGlobals: true
+            };
+
+            window.sse = {
+                options: sseOptions,
+                settings: bootstrap.settings ?? fetch(settingsUrl).then((response) => response.json())
+            };
+        </script>
+    </head>
+    <body>
+        <!-- Application Script -->
+        <script type="module">
+            import { createViewer } from './index.js';
+
+            const { options, settings } = window.sse;
+
+            // the viewer builds its own subtree (canvas, ui, icons) inside the container; the
+            // standalone document's container is the page itself
+            // kept on window for debugging; game.js drives the camera through window.app
+            createViewer({ container: document.body, settings, ...options }).then((viewer) => {
+                window.sseViewer = viewer;
+            });
+        </script>
+
+        <!-- The game (separate module: a failure here never stops the viewer) -->
+        <script type="module" src="./game.js"></script>
+    </body>
+</html>
