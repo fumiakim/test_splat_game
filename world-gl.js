@@ -256,6 +256,42 @@ ${FRAG}
 uniform vec4 uBlobs[${MAX_BLOBS}]; // x, z, radius, strength
 uniform int uBlobN;
 uniform float uStyle; // 0 canyon rock, 1 the fortress's metal plating
+// the player's own shadow, straight down: a map seen from above holding the lowest point of the body
+// over each spot (r, as height) and whether the body is there at all (g)
+uniform sampler2D uShadow;
+uniform vec4 uShadowBox; // centre x, centre z, half size, the player's height (for decoding r)
+uniform float uShadowOn;
+// the thrusters' light pooled on the floor round the shadow, stronger the lower the player flies:
+// so the dark shape shows even on a floor already in shade
+float bodyPool(vec3 p) {
+    if (uShadowOn < 0.5) return 0.0;
+    float hgt = max(uShadowBox.w - p.y - 2.5, 0.0);
+    float R = 4.5 + hgt * 0.3;
+    float d = length(p.xz - uShadowBox.xy);
+    return (1.0 - smoothstep(R * 0.2, R, d)) * (1.0 - smoothstep(1.0, 14.0, hgt));
+}
+float bodyShadow(vec3 p) {
+    if (uShadowOn < 0.5) return 1.0;
+    vec2 uv = (p.xz - uShadowBox.xy) / (2.0 * uShadowBox.z) + 0.5;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return 1.0;
+    // how high the body is above this spot (from the nearest body point around it)
+    float hgt = 99.0;
+    for (int i = -1; i <= 1; i++)
+    for (int j = -1; j <= 1; j++) {
+        vec4 c = texture(uShadow, uv + vec2(float(i), float(j)) * 0.03);
+        if (c.g > 0.5) hgt = min(hgt, c.r * 12.0 - 6.0 + uShadowBox.w - p.y);
+    }
+    if (hgt > 90.0) return 1.0;
+    hgt = max(hgt, 0.0);
+    // sharp when close, spread and faint higher up
+    float spread = mix(0.002, 0.03, smoothstep(0.0, 12.0, hgt));
+    float cover = 0.0;
+    for (int i = -2; i <= 2; i++)
+    for (int j = -2; j <= 2; j++) cover += texture(uShadow, uv + vec2(float(i), float(j)) * spread).g;
+    cover /= 25.0;
+    float dark = mix(0.95, 0.5, smoothstep(0.0, 16.0, hgt));
+    return 1.0 - cover * dark;
+}
 in vec3 vPos;
 in vec3 vNormal;
 in vec2 vShade;
@@ -295,7 +331,11 @@ void main() {
         vec3 N = bump(N0, p, h, 1.35 * (1.0 - smoothstep(40.0, 150.0, vDepth)));
         alb *= alb;
         vec3 light = lighting(N, vShade.y);
-        light *= mix(1.0, blobShadow(p), smoothstep(0.72, 0.95, N0.y));
+        float onFloor = smoothstep(0.72, 0.95, N0.y);
+        float shade = mix(1.0, blobShadow(p) * bodyShadow(p), onFloor);
+        // the thrusters' pool of light round the player's shadow (the shadow stays dark inside it)
+        light += vec3(0.55, 0.72, 1.0) * 1.6 * bodyPool(p) * onFloor;
+        light *= shade;
         vec3 col = alb * light * vShade.x + vec3(1.0, 0.8, 0.55) * lamp * 1.6;
         outColor = finish(col, p);
         return;
@@ -313,7 +353,7 @@ void main() {
 
     vec3 light = lighting(N, vShade.y);
     // soft shadows straight down from the player and the rocks
-    light *= mix(1.0, blobShadow(p), ground);
+    light *= mix(1.0, blobShadow(p) * bodyShadow(p), ground);
     outColor = finish(alb * light * vShade.x, p);
 }`;
 
@@ -324,7 +364,7 @@ layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec3 iPos;
 layout(location = 3) in vec3 iScale;
 layout(location = 4) in vec4 iQuat;
-layout(location = 5) in vec4 iExtra; // heat, sun visibility, seed, kind (0 meteor, 1 canyon rock, 2 comet, 3 obstacle box, 4 decor box)
+layout(location = 5) in vec4 iExtra; // heat, sun visibility, seed, kind (0 meteor, 1 canyon rock, 2 comet, 3 obstacle box, 4 decor box, 5 mine)
 layout(location = 6) in float aAO;   // how open the surface is to the sky (low in necks, cracks, craters)
 ${COMMON}
 out float vAO;
@@ -368,6 +408,37 @@ void main() {
     if (solidHidden(vDepth)) discard;
     vec3 N0 = normalize(vNormal);
     float seed = vExtra.z * 61.0;
+    if (vExtra.w > 4.5) {
+        // a floating mine: a dark gunmetal ball with pale spikes, plates seamed by rings, and a band of
+        // red lamps round its middle that blink faster as the player comes near (vExtra.x)
+        float r = length(vUnit);
+        bool spike = r > 1.03;
+        vec3 dir = vUnit / max(r, 1e-3);
+        float lon = atan(dir.z, dir.x);
+        float lat = asin(clamp(dir.y, -1.0, 1.0));
+        float seamA = 1.0 - smoothstep(0.0, 0.035, abs(fract(lon / 6.2832 * 6.0 + 0.5) - 0.5));
+        float seamB = 1.0 - smoothstep(0.0, 0.05, abs(fract(lat / 3.1416 * 4.0 + 0.5) - 0.5));
+        vec3 alb = spike ? vec3(0.62, 0.6, 0.55) : vec3(0.24, 0.25, 0.27) * (1.0 - 0.45 * max(seamA, seamB));
+        alb *= alb;
+        vec3 V = normalize(uCam - vPos);
+        vec3 col = alb * lighting(N0, vExtra.y);
+        // a hard metal glint
+        vec3 H = normalize(uSun + V);
+        col += uSunCol * 0.35 * pow(max(dot(N0, H), 0.0), 40.0);
+        float rim = pow(1.0 - max(dot(N0, V), 0.0), 3.0);
+        col += uSkyCol * 0.5 * rim;
+        // the lamps: eight round the equator
+        float sector = fract(lon / 6.2832 * 8.0) - 0.5;
+        float lampD = length(vec2(sector * 0.785, dir.y));
+        float lamp = (1.0 - smoothstep(0.07, 0.12, lampD)) * (spike ? 0.0 : 1.0);
+        float rate = mix(1.2, 8.0, vExtra.x);
+        float blink = step(0.45, fract(uTime * rate + vExtra.z * 3.7));
+        col += vec3(2.4, 0.18, 0.06) * lamp * (0.2 + 0.8 * blink);
+        // a faint red glow round the band too, when near
+        col += vec3(0.5, 0.03, 0.01) * vExtra.x * blink * (1.0 - smoothstep(0.0, 0.35, abs(dir.y))) * (spike ? 0.0 : 1.0);
+        outColor = finish(col, vPos);
+        return;
+    }
     if (vExtra.w > 2.5) {
         // a box of the fortress: plated like the trench, in its own frame (face by face)
         vec3 a = abs(vUnit);
@@ -490,6 +561,36 @@ void main() {
     outColor = vec4(0.0);
 }`;
 
+// the player's shadow map: its balls seen from straight above, each a disc whose depth is its lowest
+// point, so the lowest wins; r keeps that height, g marks "the body is over here"
+const SHADOW_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in vec4 iBall; // x, y, z, radius (game coordinates)
+uniform vec4 uShadowBox; // centre x, centre z, half size, the player's height
+uniform vec2 uShadowCast; // the floor's height there, how far forward per unit of height
+out vec2 vUv;
+out float vH;
+void main() {
+    float r = iBall.w * 1.35;
+    // cast a little forward (light from above and behind the camera), so it shows ahead of the model:
+    // under its feet when low, further ahead the higher it flies
+    vec2 xz = vec2(iBall.x, iBall.z + max(iBall.y - uShadowCast.x, 0.0) * uShadowCast.y) + aCorner * r;
+    vUv = aCorner;
+    vH = clamp((iBall.y - r - uShadowBox.w + 6.0) / 12.0, 0.0, 1.0);
+    gl_Position = vec4((xz - uShadowBox.xy) / uShadowBox.z, vH * 2.0 - 1.0, 1.0);
+}`;
+
+const SHADOW_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in float vH;
+out vec4 outColor;
+void main() {
+    if (dot(vUv, vUv) > 1.0) discard;
+    outColor = vec4(vH, 1.0, 0.0, 1.0);
+}`;
+
 const SPARK_VS = `#version 300 es
 precision highp float;
 layout(location = 0) in vec2 aCorner;
@@ -610,6 +711,70 @@ void main() {
 }`;
 
 let rockMeshes = null; // shared by both canvases (built once)
+const SHADOW_RES = 256; // the player's shadow map (texels each way)
+const SHADOW_HALF = 6; // ... covering this far round where it falls (game units)
+const SHADOW_SLANT = 1.1; // the shadow falls this far forward per unit of height
+
+// a floating mine: a ball of radius 1 with spikes out to 1.55 (along the 6 axes and 8 diagonals)
+const buildMineMesh = () => {
+    const F = ROCK_VERT_FLOATS;
+    const verts = [];
+    const index = [];
+    const put = (p, n) => {
+        verts.push(p[0], p[1], p[2], n[0], n[1], n[2], 1);
+        return verts.length / F - 1;
+    };
+    // the ball
+    const LAT = 14;
+    const LON = 24;
+    const first = verts.length / F;
+    for (let i = 0; i <= LAT; i++) {
+        const th = (i / LAT) * Math.PI;
+        for (let j = 0; j <= LON; j++) {
+            const ph = (j / LON) * Math.PI * 2;
+            const n = [Math.sin(th) * Math.cos(ph), Math.cos(th), Math.sin(th) * Math.sin(ph)];
+            put(n, n);
+        }
+    }
+    for (let i = 0; i < LAT; i++) {
+        for (let j = 0; j < LON; j++) {
+            const a = first + i * (LON + 1) + j;
+            const b = a + LON + 1;
+            index.push(a, b, a + 1, a + 1, b, b + 1);
+        }
+    }
+    // the spikes: cones
+    const dirs = [];
+    for (const v of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) dirs.push(v);
+    for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) dirs.push([sx / Math.sqrt(3), sy / Math.sqrt(3), sz / Math.sqrt(3)]);
+    const SEG = 8;
+    const base = 0.9;
+    const tip = 1.55;
+    const rad = 0.13;
+    for (const d of dirs) {
+        // two directions across the spike
+        const h = Math.abs(d[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+        let u = [d[1] * h[2] - d[2] * h[1], d[2] * h[0] - d[0] * h[2], d[0] * h[1] - d[1] * h[0]];
+        const ul = Math.hypot(...u);
+        u = u.map((x) => x / ul);
+        const v = [d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2], d[0] * u[1] - d[1] * u[0]];
+        const slope = rad / (tip - base);
+        const tipI = put(d.map((x) => x * tip), d);
+        const ring = [];
+        for (let k = 0; k < SEG; k++) {
+            const a = (k / SEG) * Math.PI * 2;
+            const c = Math.cos(a);
+            const s = Math.sin(a);
+            const out = [u[0] * c + v[0] * s, u[1] * c + v[1] * s, u[2] * c + v[2] * s];
+            const p = [d[0] * base + out[0] * rad, d[1] * base + out[1] * rad, d[2] * base + out[2] * rad];
+            const n = [out[0] + d[0] * slope, out[1] + d[1] * slope, out[2] + d[2] * slope];
+            const nl = Math.hypot(...n);
+            ring.push(put(p, n.map((x) => x / nl)));
+        }
+        for (let k = 0; k < SEG; k++) index.push(ring[k], ring[(k + 1) % SEG], tipI);
+    }
+    return { data: new Float32Array(verts), index: new Uint16Array(index) };
+};
 
 // a unit box (-1..1), flat faces: the fortress's blocks
 const buildBoxMesh = () => {
@@ -641,6 +806,7 @@ const buildBoxMesh = () => {
 export class WorldGL {
     constructor(gl) {
         this.gl = gl;
+        WorldGL.all.push(this); // (for poking at from the console)
         const compile = (type, src) => {
             const sh = gl.createShader(type);
             gl.shaderSource(sh, src);
@@ -664,7 +830,8 @@ export class WorldGL {
             return { prog, u };
         };
         const SOLID_U = ['uProxyOn', 'uBodyR', 'uProxyDepth'];
-        this.terrain = link(TERRAIN_VS, TERRAIN_FS, ['uBlobs', 'uBlobN', 'uStyle', ...SOLID_U]);
+        this.terrain = link(TERRAIN_VS, TERRAIN_FS, ['uBlobs', 'uBlobN', 'uStyle', 'uShadow', 'uShadowBox', 'uShadowOn', ...SOLID_U]);
+        this.shadowProg = link(SHADOW_VS, SHADOW_FS, ['uShadowBox', 'uShadowCast']);
         this.rock = link(ROCK_VS, ROCK_FS, SOLID_U);
         this.proxy = link(PROXY_VS, PROXY_FS, ['uInflate']);
         this.spark = link(SPARK_VS, SPARK_FS);
@@ -700,7 +867,7 @@ export class WorldGL {
         gl.bindVertexArray(null);
 
         // rocks: instanced meshes, one per shape (rock-shapes.js)
-        if (!rockMeshes) rockMeshes = [...getRockShapes(), buildBoxMesh()];
+        if (!rockMeshes) rockMeshes = [...getRockShapes(), buildBoxMesh(), buildMineMesh()];
         this.rocks = rockMeshes.map((mesh) => {
             const vao = gl.createVertexArray();
             gl.bindVertexArray(vao);
@@ -763,6 +930,24 @@ export class WorldGL {
         gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
         gl.vertexAttribDivisor(1, 1);
         gl.bindVertexArray(null);
+        // the player's shadow map (seen from above)
+        this.shadowTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, SHADOW_RES, SHADOW_RES, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        this.shadowDepth = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, this.shadowDepth);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, SHADOW_RES, SHADOW_RES);
+        this.shadowFbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.shadowTex, 0);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.shadowDepth);
+        this.shadowOk = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        this.shadowBox = new Float32Array(4);
         this.proxyTex = gl.createTexture();
         this.proxyColor = gl.createRenderbuffer();
         this.proxyFbo = gl.createFramebuffer();
@@ -821,10 +1006,18 @@ export class WorldGL {
     drawTerrain(frame, world, layer, proxyOn = false, body = null) {
         const { gl } = this;
         const t = world.terrain;
+        // the player's shadow on the ground, shaped like the model
+        const shadowOn = !!(body && body.n && world.player) && this.drawShadow(frame, body, world.player, world.track.floorY(world.player.z));
         const p = this.terrain;
         gl.useProgram(p.prog);
         this.setCommon(p, frame, layer);
         this.setProxy(p, proxyOn, body);
+        gl.activeTexture(gl.TEXTURE6);
+        gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.uniform1i(p.u.uShadow, 6);
+        gl.uniform4fv(p.u.uShadowBox, this.shadowBox);
+        gl.uniform1f(p.u.uShadowOn, shadowOn ? 1 : 0);
         gl.uniform4fv(p.u.uBlobs, world.blobs);
         gl.uniform1i(p.u.uBlobN, world.blobCount);
         gl.uniform1f(p.u.uStyle, world.mode === 'trench' ? 1 : 0);
@@ -896,6 +1089,40 @@ export class WorldGL {
         gl.colorMask(true, true, true, true);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.viewport(0, 0, w, h);
+        return true;
+    }
+
+    // the player's shadow map: the body's balls seen from above, around the player
+    drawShadow(frame, body, player, floorY) {
+        const { gl } = this;
+        if (!this.shadowOk) return false;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.proxyInst);
+        if (this.proxyCap < body.n) {
+            this.proxyCap = body.n;
+            gl.bufferData(gl.ARRAY_BUFFER, body.pts.byteLength, gl.DYNAMIC_DRAW);
+        }
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, body.pts, 0, body.n * 4);
+        this.shadowBox.set([player.x, player.z + Math.max(player.y - floorY, 0) * SHADOW_SLANT, SHADOW_HALF, player.y]);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
+        gl.viewport(0, 0, SHADOW_RES, SHADOW_RES);
+        gl.clearColor(1, 0, 0, 0);
+        gl.clearDepth(1);
+        gl.depthMask(true);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LESS);
+        gl.disable(gl.BLEND);
+        const p = this.shadowProg;
+        gl.useProgram(p.prog);
+        gl.uniform4fv(p.u.uShadowBox, this.shadowBox);
+        gl.uniform2f(p.u.uShadowCast, floorY, SHADOW_SLANT);
+        gl.bindVertexArray(this.proxyVao);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, body.n);
+        gl.bindVertexArray(null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, frame.vw, frame.vh);
+        gl.clearColor(0, 0, 0, 0);
+        gl.depthFunc(gl.LEQUAL);
         return true;
     }
 
@@ -975,3 +1202,5 @@ export class WorldGL {
         gl.bindVertexArray(null);
     }
 }
+
+WorldGL.all = [];

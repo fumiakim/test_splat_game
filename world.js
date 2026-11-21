@@ -71,7 +71,12 @@ export const TRENCH = {
     curveCalm: 0.8, // カーブの間、ふだんのうねりをどれだけ止めるか（うねりを引き伸ばして、なめらかに）
     curveEase: 30, // ... その入り・抜けの長さ
     curveRamp: 5,
-    curveWarn: 210 // カーブの手前、この距離で画面に予告を出す
+    curveWarn: 210, // カーブの手前、この距離で画面に予告を出す
+    // 浮遊する機雷: ゆっくり上下・左右に漂い、近づくと赤いランプが速く点滅する。触れると爆発
+    mineFrom: 300, // スタートからこの距離を過ぎてから
+    mineEvery: [150, 70], // 機雷の群れの間隔（単位、開始時 → 最高難度）
+    mineSize: [1.0, 1.4], // 大きさ（本体の半径、とげはその 1.55 倍まで）
+    mineHit: 1.15 // 当たりの半径（本体の半径に対する比。とげの根元あたり）
 };
 const smoother = (t) => t * t * t * (t * (t * 6 - 15) + 10);
 // a curve's own sideways offset, t = 0..1 along it (a sharp one ends at its shift, the others at 0)
@@ -94,7 +99,11 @@ const NF = 13; // 谷底
 export const PROFILE_N = 2 * NP + 2 * NW + NF;
 
 export const BOX_VARIANT = SHAPE_COUNT; // 箱（要塞の溝の障害物と飾り）のメッシュの番号
-export const ROCK_VARIANTS = SHAPE_COUNT + 1; // 岩の形の数＋箱（形ごとにまとめて描く）
+export const MINE_VARIANT = SHAPE_COUNT + 1; // 機雷のメッシュの番号
+export const ROCK_VARIANTS = SHAPE_COUNT + 2; // 岩の形の数＋箱＋機雷（形ごとにまとめて描く）
+// 当たりの許し: 体がこれだけ（ゲームの単位）めり込むまでは当たりにしない。それより浅く触れたときは
+// 火花だけ（シールドは減らない）。見た目でかすめただけなのに当たった、を無くす
+export const HIT_TOLERANCE = 0.25;
 export const ROCK_FLOATS = 14; // pos3 scale3 quat4 heat shadow seed -
 export const MAX_ROCKS = 640;
 export const SPARK_FLOATS = 8; // pos3 size rgb intensity
@@ -699,13 +708,14 @@ export class Sparks {
 const CHUNK = 30; // obstacles are laid out chunk by chunk
 const SPAWN_AHEAD = 290;
 const GRACE = 320; // nothing in the way for the first stretch of a run
-const ROCK_KIND = { meteor: 0, pillar: 1, bridge: 1, comet: 2, block: 3, deco: 4, greeble: 4 }; // how world-gl.js shades each
+const ROCK_KIND = { meteor: 0, pillar: 1, bridge: 1, comet: 2, block: 3, deco: 4, greeble: 4, mine: 5 }; // how world-gl.js shades each
 const STRUCTURE = new Set(['block', 'deco', 'greeble']); // boxes of the fortress (greeble: parts on the trench walls)
 
 export class World {
     constructor({ mode = 'space' } = {}) {
         this.mode = mode;
         this.trenchSpec = TRENCH; // for game.js
+        this.hitTolerance = HIT_TOLERANCE; // (for game.js too, without a new import)
         this.bodyProxy = null; // the player's body as balls, set by game.js each frame (for drawing)
         this.terrain = new Terrain();
         this.shapes = getRockShapes();
@@ -750,6 +760,7 @@ export class World {
         this.lastBridge = -Infinity;
         this.lastGiant = -Infinity;
         this.nextObstacle = Infinity;
+        this.nextMine = Infinity;
         // the fortress's surface structures, laid out whether or not a run is on (also behind, for
         // the title camera that looks back)
         this.nextDeco = Math.floor((z - 240) / CHUNK) * CHUNK;
@@ -765,6 +776,7 @@ export class World {
         this.nextChunk = Math.floor((z + grace) / CHUNK) * CHUNK;
         this.nextComet = this.mode === 'trench' ? Infinity : this.time + (this.canyon ? 14 : SPACE.cometFirst);
         this.nextObstacle = z + grace;
+        this.nextMine = z + Math.max(grace, TRENCH.mineFrom);
         // no obstacles left over from the title's cruise in the way
         this.rocks = this.rocks.filter((r) => r.kind === 'deco' || r.kind === 'greeble');
     }
@@ -778,6 +790,7 @@ export class World {
     spawnChunk(zc, player) {
         if (this.mode === 'trench') {
             this.spawnTrench(zc);
+            this.spawnMines(zc);
             return;
         }
         const rnd = this.rnd;
@@ -1069,8 +1082,135 @@ export class World {
         }
     }
 
+    // floating mines: alone, in a row across, stacked, or scattered. A mine is only kept if the body
+    // still has a way past it there (clear of every mine and block within a few units of its z)
+    spawnMines(zc) {
+        const rnd = this.rnd;
+        const tr = this.track;
+        if (zc + CHUNK < this.nextMine) return;
+        const z = Math.max(zc, this.nextMine);
+        const d = tr.diff(z);
+        this.nextMine = z + lerp(...TRENCH.mineEvery, d) * lerp(0.75, 1.3, rnd());
+        // not in the middle of a sharp curve
+        const c = tr.curveAt(z + 20);
+        if (c && c.kind === 'sharp' && z + 40 > c.start && z - 40 < c.start + c.len) return;
+        const D = TRENCH.depth;
+        const fl = TRENCH.floor;
+        const at = (zz) => [tr.centerX(zz), tr.halfWidth(zz)];
+        const spots = [];
+        const u = rnd();
+        if (u < 0.3) {
+            const [cx, hw] = at(z);
+            spots.push([cx + (rnd() * 2 - 1) * (hw - 2.5), fl + lerp(4, D - 5, rnd()), z]);
+        } else if (u < 0.55) {
+            // a row across at one height
+            const [cx, hw] = at(z);
+            const y = fl + lerp(5, D - 6, rnd());
+            const n = 2 + (rnd() < 0.5 ? 1 : 0);
+            for (let i = 0; i < n; i++) spots.push([cx + lerp(-hw + 2, hw - 2, (i + 0.2 + rnd() * 0.6) / n), y + (rnd() - 0.5) * 2, z + (rnd() - 0.5) * 3]);
+        } else if (u < 0.78) {
+            // a column at one side
+            const [cx, hw] = at(z);
+            const x = cx + (rnd() * 2 - 1) * (hw - 3);
+            const n = 2 + (rnd() < 0.4 ? 1 : 0);
+            for (let i = 0; i < n; i++) spots.push([x + (rnd() - 0.5) * 2, fl + lerp(4, D - 4, (i + 0.2 + rnd() * 0.6) / n), z + (rnd() - 0.5) * 3]);
+        } else {
+            // a scatter along the trench
+            const n = 3 + Math.floor(rnd() * 3);
+            for (let i = 0; i < n; i++) {
+                const zz = z + rnd() * 45;
+                const [cx, hw] = at(zz);
+                spots.push([cx + (rnd() * 2 - 1) * (hw - 2.5), fl + lerp(4, D - 5, rnd()), zz]);
+            }
+        }
+        for (const [x, y, zz] of spots) {
+            const s = lerp(...TRENCH.mineSize, rnd());
+            const m = { x, y, z: zz, r: s * TRENCH.mineHit };
+            if (!this.passable(m)) continue;
+            this.addRock({
+                kind: 'mine',
+                variant: MINE_VARIANT,
+                x,
+                y,
+                z: zz,
+                hx: x - tr.centerX(zz), // where it floats, from the trench's line
+                hy: y,
+                sx: s,
+                sy: s,
+                sz: s,
+                q: randomQuat(rnd),
+                spin: randomDir(rnd),
+                spinRate: lerp(0.2, 0.6, rnd()),
+                bob: lerp(0.4, 1.0, rnd()), // how far it rises and sinks
+                sway: lerp(0, 1.6, rnd()), // ... and drifts side to side
+                phase: rnd() * TAU,
+                hitR: s * TRENCH.mineHit,
+                heat: 0
+            });
+        }
+    }
+
+    // is there still room for the body past a new mine m ({ x, y, z, r }) at its z? A point of the
+    // cross-section counts as room if the body there (about 2 wide each way, 2.9 up and down) keeps
+    // clear of the walls, the floor, the rim and every mine and block nearby
+    passable(m) {
+        const tr = this.track;
+        const fl = TRENCH.floor;
+        const top = fl + TRENCH.depth - 3.6;
+        const cx = tr.centerX(m.z);
+        const hz = [...this.rocks.filter((r) => (r.kind === 'mine' || r.kind === 'block') && Math.abs(r.z - m.z) < 6), m];
+        for (let y = fl + 3; y <= top; y += 1) {
+            const half = Math.abs(tr.wallX(1, y, m.z) - cx) - 2.2;
+            for (let x = cx - half; x <= cx + half; x += 0.8) {
+                let ok = true;
+                for (const h of hz) {
+                    if (h.kind === 'block') {
+                        if (World.boxClear(h, x, y, h.z, 2.4).c < 0) {
+                            ok = false;
+                            break;
+                        }
+                    } else if (Math.abs(x - h.x) < 2.2 + (h.r ?? h.hitR) && Math.abs(y - (h.hy ?? h.y)) < 3.0 + (h.r ?? h.hitR) + (h.bob ?? 0)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) return true;
+            }
+        }
+        return false;
+    }
+
+    // the floor's own relief: low blocks and pipes running along it, as hard as the floor (they stand
+    // up to about 0.8, so flying low is where they matter)
+    spawnFloorParts(zc) {
+        const rnd = this.rnd;
+        const tr = this.track;
+        const n = 2 + Math.floor(rnd() * 3);
+        for (let i = 0; i < n; i++) {
+            const z = zc + rnd() * CHUNK;
+            const hw = tr.halfWidth(z);
+            let hx;
+            let hz;
+            let top;
+            if (rnd() < 0.55) {
+                // a low block
+                hx = lerp(0.6, 2.2, rnd());
+                hz = lerp(0.6, 2.4, rnd());
+                top = lerp(0.3, 0.8, rnd());
+            } else {
+                // a pipe along the floor
+                hx = lerp(0.18, 0.3, rnd());
+                hz = lerp(3, 7, rnd());
+                top = 2 * hx;
+            }
+            const across = (rnd() * 2 - 1) * Math.max(0, hw - hx - 0.4);
+            // set 0.3 into the floor, standing `top` above it
+            this.trenchBox('greeble', z, across, (top - 0.3) / 2, hx, (top + 0.3) / 2, hz);
+        }
+    }
+
     // blocks, towers and pipes on the fortress's surface beside the trench (only to look at: the
-    // player stays inside the trench), and the walls' own relief
+    // player stays inside the trench), and the walls' and floor's own relief
     spawnDecoUntil(zEnd) {
         const rnd = this.rnd;
         const tr = this.track;
@@ -1078,6 +1218,7 @@ export class World {
         while (this.nextDeco < zEnd) {
             const zc = this.nextDeco;
             this.nextDeco += CHUNK;
+            this.spawnFloorParts(zc);
             for (const side of [-1, 1]) {
                 this.spawnGreebles(zc, side);
                 const n = 4 + Math.floor(rnd() * 5);
@@ -1156,7 +1297,11 @@ export class World {
         };
         rock.shadow = this.terrainOn ? this.track.sunVis(rock.x, rock.y + rock.sy * 0.3, rock.z) : 1;
         // how far from its centre the rock reaches (its shape's furthest point)
-        rock.reach = STRUCTURE.has(rock.kind) ? Math.hypot(rock.sx, rock.sy, rock.sz) : this.shapes[rock.variant].maxR * Math.max(rock.sx, rock.sy, rock.sz);
+        rock.reach = STRUCTURE.has(rock.kind)
+            ? Math.hypot(rock.sx, rock.sy, rock.sz)
+            : rock.kind === 'mine'
+              ? 1.6 * rock.sx
+              : this.shapes[rock.variant].maxR * Math.max(rock.sx, rock.sy, rock.sz);
         this.rocks.push(rock);
         return rock;
     }
@@ -1236,6 +1381,13 @@ export class World {
         for (const r of this.rocks) {
             if (r.done) continue;
             if (r.spinRate) r.q = qMul(qAxis(r.spin[0], r.spin[1], r.spin[2], r.spinRate * dt), r.q);
+            if (r.kind === 'mine') {
+                r.y = r.hy + r.bob * Math.sin(this.time * 0.9 + r.phase);
+                r.x = tr.centerX(r.z) + r.hx + r.sway * Math.sin(this.time * 0.45 + r.phase * 1.7);
+                // its lamps blink faster as the player comes near (world-gl.js reads it from heat)
+                const dist = Math.hypot(r.x - player.x, r.y - player.y, r.z - player.z);
+                r.heat = smooth01(1 - (dist - 6) / 60);
+            }
             if (r.kind === 'meteor' && (r.vx || r.vy)) {
                 r.x += r.vx * dt;
                 r.y += r.vy * dt;
@@ -1550,6 +1702,7 @@ export class World {
             }
             const solid = r.kind === 'meteor' || r.kind === 'comet';
             const box = r.kind === 'block' || r.kind === 'greeble';
+            const mine = r.kind === 'mine';
             let clear = Infinity;
             let hit = null; // the ball nearest the rock
             let grad = null;
@@ -1559,7 +1712,9 @@ export class World {
                 const z = pts[i * 4 + 2];
                 const pr = pts[i * 4 + 3];
                 let c;
-                if (box) {
+                if (mine) {
+                    c = Math.hypot(x - r.x, y - r.y, z - r.z) - pr - r.hitR;
+                } else if (box) {
                     // only contact matters for the walls' parts; near misses too for obstacles
                     const lb = Math.hypot(x - r.x, y - r.y, z - r.z) - pr - r.reach;
                     if (lb >= clear || lb > (r.kind === 'greeble' ? 0.3 : 2.0)) {
@@ -1588,12 +1743,16 @@ export class World {
                 }
             }
             if (clear < r.minClear) r.minClear = clear;
-            if (clear < 0 && hit && !r.hit && !invulnerable) {
+            // a hit only once the body is in by more than the tolerance; a lighter touch only grazes
+            if (clear < -HIT_TOLERANCE && hit && !r.hit && !invulnerable) {
                 r.hit = true;
                 // pushed away from the rock's centre (a pillar or bridge: out along its surface)
-                const g = (solid || !grad) && !box ? [hit[0] - r.x, hit[1] - r.y] : grad;
+                const g = (solid || mine || !grad) && !box ? [hit[0] - r.x, hit[1] - r.y] : grad;
                 const gl = Math.hypot(g[0], g[1]);
                 out.push({ type: 'hit', rock: r, nx: gl > 1e-4 ? g[0] / gl : 0, ny: gl > 1e-4 ? g[1] / gl : 1, at: hit });
+            } else if (clear < 0 && hit && !r.hit && !r.grazed) {
+                r.grazed = true;
+                out.push({ type: 'graze', rock: r, at: hit });
             }
         }
         return out;

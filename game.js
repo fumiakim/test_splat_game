@@ -586,7 +586,8 @@ const createGame = () => {
 
     // ---- flying
 
-    const damage = () => {
+    // metal: struck the fortress (its clang is played by the caller instead of the thud)
+    const damage = (metal = false) => {
         if (p.inv > 0 || !p.alive) return;
         p.hp -= 1;
         p.inv = TUNE.inv;
@@ -595,15 +596,27 @@ const createGame = () => {
         pose.wobble = 1;
         run.combo = 0;
         hud.hit();
-        audio.hit();
+        if (!metal) audio.hit();
         light.hit();
         if (p.hp <= 0) die();
     };
 
+    // the fortress is metal: a high clang (softer while still shielded from the last hit); the canyon's
+    // rock: a scrape and a thud. (audio.clang may be missing from a stale cached audio.js)
+    const clang = (hurts) => {
+        if (audio.clang) audio.clang(hurts && p.inv <= 0 ? 1 : 0.5);
+        else audio.scrape();
+    };
+    const grazeSound = () => (scene === 'trench' && audio.screech ? audio.screech() : audio.scrape());
     const wallHit = (side, damaging) => {
         world.burst(p.x + side * PLAYER_HALF_W, p.y - 0.5, p.z + 1.2, { sparks: 26, speed: 11, debris: 6, color: [1, 0.75, 0.4] });
-        audio.scrape();
-        if (damaging) damage();
+        if (scene === 'trench') {
+            clang(damaging);
+            if (damaging) damage(true);
+        } else {
+            audio.scrape();
+            if (damaging) damage();
+        }
     };
 
     // open space: the flying area is a box; its edge stops the player (no damage) and glows
@@ -639,27 +652,52 @@ const createGame = () => {
         }
         const b = updateBody();
         const c = b ? world.trenchContact(b.pts, b.n) : world.trenchContact([p.x, p.y - 2, p.z, PLAYER_HALF_W, p.x, p.y + 1, p.z, PLAYER_HALF_W], 2);
-        if (c.floor > 0) {
-            p.y += c.floor;
-            if (p.vy < 0) p.vy = 0;
-            // skimming the floor: sparks off the plating
-            if (Math.random() < 0.6) {
-                world.sparks.emit(p.x + (Math.random() - 0.5) * 2, TRENCH.floor + 0.2, p.z + 0.5, (Math.random() - 0.5) * 6, 2 + Math.random() * 4, -p.speed * 0.25, 0.4, 0.15, 0.03, 1, 0.75, 0.4, 2.0, 9, 1.2);
+        // the floor and the walls count once the body is in by more than the tolerance; a lighter
+        // touch only throws sparks off them
+        const tol = world.hitTolerance ?? 0;
+        const floorSparks = (n, up) => {
+            for (let k = 0; k < n; k++) {
+                world.sparks.emit(p.x + (Math.random() - 0.5) * 2.5, TRENCH.floor + 0.2, p.z + 0.5, (Math.random() - 0.5) * 6, up * (0.5 + Math.random()), -p.speed * 0.25, 0.4, 0.15, 0.03, 1, 0.75, 0.4, 2.0, 9, 1.2);
+            }
+        };
+        if (c.floor > tol) {
+            // struck the floor: thrown back up, and it hurts
+            p.y += c.floor + 0.2;
+            p.vy = Math.max(p.vy, 0) + 7;
+            world.burst(p.x, TRENCH.floor + 0.3, p.z + 0.8, { sparks: 26, speed: 11, debris: 6, color: [1, 0.75, 0.4], up: 3 });
+            clang(damaging);
+            if (damaging) damage(true);
+        } else if (c.floor > 0) {
+            // skimming it: sparks off the plating
+            if (Math.random() < 0.6) floorSparks(1, 4);
+            if (time - lastGraze > 0.3) {
+                lastGraze = time;
+                grazeSound();
             }
         }
-        if (c.left > 0 && c.right > 0) {
+        if (c.left > tol && c.right > tol) {
             p.x = tr.centerX(p.z);
             wallHit(c.left > c.right ? -1 : 1, damaging);
-        } else if (c.left > 0) {
+        } else if (c.left > tol) {
             p.x += c.left / c.cos + 0.25;
             p.vx = Math.max(p.vx, 0) + 8;
             wallHit(-1, damaging);
-        } else if (c.right > 0) {
+        } else if (c.right > tol) {
             p.x -= c.right / c.cos + 0.25;
             p.vx = Math.min(p.vx, 0) - 8;
             wallHit(1, damaging);
+        } else if (c.left > 0 || c.right > 0) {
+            const side = c.left > c.right ? -1 : 1;
+            if (Math.random() < 0.5) {
+                world.sparks.emit(p.x + side * 1.9, p.y + (Math.random() - 0.5) * 3, p.z + 0.8, -side * (2 + Math.random() * 4), (Math.random() - 0.5) * 4, -p.speed * 0.3, 0.35, 0.14, 0.03, 1, 0.8, 0.5, 2.0, 6, 1.2);
+            }
+            if (time - lastGraze > 0.3) {
+                lastGraze = time;
+                grazeSound();
+            }
         }
     };
+    let lastGraze = -1;
 
     const terrainCollide = (inp, damaging) => {
         if (scene === 'space') {
@@ -740,16 +778,31 @@ const createGame = () => {
                 } else if (r.kind === 'comet') {
                     r.done = true;
                     world.burst(r.x, r.y, r.z, { sparks: 90, speed: 20, debris: 20, flash: 14, color: [0.6, 0.85, 1] });
+                } else if (r.kind === 'mine') {
+                    // a mine goes off
+                    r.done = true;
+                    world.burst(r.x, r.y, r.z, { sparks: 90, speed: 24, debris: 26, fire: 34, flash: 20, color: [1, 0.55, 0.2] });
+                    audio.boom(0);
+                    shake = Math.max(shake, 1.3);
                 }
-                damage();
+                // the fortress's blocks and wall parts are metal
+                const metal = r.kind === 'block' || r.kind === 'greeble';
+                if (metal) clang(true);
+                damage(metal);
+            } else if (ev.type === 'graze') {
+                // a touch lighter than the tolerance: sparks, no harm
+                const at = ev.at ?? [p.x, p.y, p.z];
+                world.burst(at[0], at[1], at[2], { sparks: 16, speed: 9, color: [1, 0.8, 0.5] });
+                grazeSound();
             } else if (ev.type === 'near' && live && p.alive) {
                 run.combo = run.comboT > 0 ? Math.min(run.combo + 1, 9) : 1;
                 run.comboT = 4;
                 const comet = ev.rock.kind === 'comet';
-                const pts = (comet ? 300 : 100) * run.combo;
+                const mine = ev.rock.kind === 'mine';
+                const pts = (comet ? 300 : mine ? 150 : 100) * run.combo;
                 run.score += pts;
                 run.near++;
-                hud.popup(`${comet ? 'COMET ' : ''}NEAR MISS +${pts}${run.combo > 1 ? `  ×${run.combo}` : ''}`);
+                hud.popup(`${comet ? 'COMET ' : mine ? 'MINE ' : ''}NEAR MISS +${pts}${run.combo > 1 ? `  ×${run.combo}` : ''}`);
                 audio.near(run.combo);
             }
         }
@@ -1049,7 +1102,9 @@ const createGame = () => {
         }
 
         world.terrain.behindTarget = camBlend < 0.5 ? TITLE_BEHIND : RINGS_BEHIND;
-        world.fillBlobs(p, p.alive || game.state === 'title');
+        // the round blob under the player only while its shaped shadow (world-gl.js) is not there
+        world.player = p;
+        world.fillBlobs(p, (p.alive || game.state === 'title') && !world.bodyProxy);
         updateCamera(dt);
         updateModel(dt);
         // once the model and its resting pose are known: its shape for hits
