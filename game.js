@@ -857,8 +857,11 @@ const createGame = () => {
 
     const updateCamera = (dt) => {
         const c = TUNE.cam;
-        // which way the trench runs just ahead (0 elsewhere), eased so the view swings smoothly
-        const want = scene === 'trench' && world.track.slope ? Math.atan(world.track.slope(p.z + 10)) : 0;
+        // which way the trench runs just ahead (0 elsewhere, and 0 when the model does not follow the
+        // trench by itself: then it always faces straight ahead and only the keys steer it), eased so the
+        // view swings smoothly
+        const follows = scene === 'trench' && (TRENCH.follow ?? 0) > 0 && world.track.slope;
+        const want = follows ? Math.atan(world.track.slope(p.z + 10)) : 0;
         heading += (want - heading) * (1 - Math.exp(-dt * 5));
         const t = TUNE.title;
         rail.x += (p.x - rail.x) * (1 - Math.exp(-dt * c.lagX));
@@ -892,7 +895,7 @@ const createGame = () => {
             const cxC = tr.centerX(zc);
             const room = Math.abs(tr.wallX(1, p.y + ey, zc) - cxC) - 1.2;
             ex = clamp(p.x + ex, cxC - room, cxC + room) - p.x;
-            tx += (tr.centerX(p.z + tz) - p.x - tx) * 0.15 * b;
+            tx += (tr.centerX(p.z + tz) - p.x - tx) * ((TRENCH.follow ?? 0) > 0 ? 0.15 : 0.3) * b;
         }
         if (shake > 0) {
             ex += shake * 0.3 * Math.sin(time * 53.1);
