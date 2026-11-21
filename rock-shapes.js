@@ -367,22 +367,7 @@ const buildShape = (typeIndex, variant) => {
     for (let i = 0; i < nv; i++) rad[i] /= req;
     for (let i = 0; i < table.length; i++) table[i] /= req;
 
-    // how steeply the surface leans away from the ray through the centre (for the hit test)
-    const lean = new Float32Array(NT * NPH);
-    const dth = Math.PI / NT;
-    const dph = TAU / NPH;
-    for (let i = 0; i < NT; i++) {
-        const sth = Math.max(Math.sin(((i + 0.5) / NT) * Math.PI), 0.05);
-        for (let j = 0; j < NPH; j++) {
-            const r = table[i * NPH + j];
-            const up = table[Math.max(i - 1, 0) * NPH + j];
-            const dn = table[Math.min(i + 1, NT - 1) * NPH + j];
-            const rt = (dn - up) / ((Math.min(i + 1, NT - 1) - Math.max(i - 1, 0)) * dth);
-            const rp = (table[i * NPH + ((j + 1) % NPH)] - table[i * NPH + ((j + NPH - 1) % NPH)]) / (2 * dph);
-            lean[i * NPH + j] = clamp(1 / Math.sqrt(1 + (rt / r) ** 2 + (rp / (r * sth)) ** 2), 0.35, 1);
-        }
-    }
-
+    // how far the surface is from the centre in the direction (dx, dy, dz) (a unit vector)
     const sample = (dx, dy, dz) => {
         const th = Math.acos(clamp(dy, -1, 1));
         let ph = Math.atan2(dz, dx);
@@ -396,7 +381,7 @@ const buildShape = (typeIndex, variant) => {
         const tj = fj - Math.floor(fj);
         const at = (a, i, j) => a[i * NPH + j];
         const bil = (a) => lerp(lerp(at(a, i0, j0), at(a, i0, j1), tj), lerp(at(a, i0 + 1, j0), at(a, i0 + 1, j1), tj), ti);
-        return { r: bil(table), lean: bil(lean) };
+        return bil(table);
     };
 
     // positions, normals
@@ -422,7 +407,7 @@ const buildShape = (typeIndex, variant) => {
         for (const [h, w] of [[0.1, 0.45], [0.22, 0.3], [0.4, 0.25]]) {
             const q = [p[0] + n[0] * h, p[1] + n[1] * h, p[2] + n[2] * h];
             const ql = Math.hypot(...q);
-            const f = ql - sample(q[0] / ql, q[1] / ql, q[2] / ql).r;
+            const f = ql - sample(q[0] / ql, q[1] / ql, q[2] / ql);
             occ += (w * Math.max(0, h - f)) / h;
         }
         const ao = clamp(1 - occ * 2.0, 0, 1) * (1 - 0.6 * bowl[i]);

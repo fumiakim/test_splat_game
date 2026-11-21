@@ -20,6 +20,7 @@
 import { createFx, readBounds } from './space-fx.js';
 import { World, UNIT_M, MIN_ALT, MAX_ALT, RINGS_BEHIND, PLAYER_SCALE, PLAYER_HALF_W, PLAYER_PAD, AREA, SUN, qAxis, qMul } from './world.js';
 import { createSplatLight, SPLAT_LIGHT } from './splat-light.js';
+import { buildBody, BODY_BALL } from './body-shape.js';
 import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
 
@@ -47,6 +48,7 @@ const TUNE = {
 
 const CANYON = new URL(location.href).searchParams.has('canyon');
 const GALLERY = new URL(location.href).searchParams.has('rocks');
+const HITBOX = new URL(location.href).searchParams.has('hitbox'); // 自機の当たり判定の球を光の点で見せる
 const SECTORS = CANYON
     ? ['渓谷突入', '隕石帯', '岩柱の森', '天然の岩橋', '流星雨', '狭き峡谷', '深淵へ']
     : ['隕石帯突入', '小惑星群', '彗星の通り道', '岩塊の嵐', '流星群', '深宇宙へ'];
@@ -318,6 +320,38 @@ const createGame = () => {
     let camEntity = null;
     let splat = null;
     let base = null;
+    // the player's shape for hits: balls built from the scan's points (body-shape.js)
+    let gsComp = null;
+    let body = null;
+    let bodyState = 'none';
+    const bodyWorld = { pts: null, n: 0, R: 0 };
+    // the balls where the model stands now (turned and enlarged with it), in game coordinates
+    const updateBody = () => {
+        if (!body) return null;
+        if (!bodyWorld.pts) bodyWorld.pts = new Float32Array(body.n * 4);
+        const m = fx.rotMat;
+        const ks = fx.scale;
+        const rad = body.cell * BODY_BALL * ks;
+        const out = bodyWorld.pts;
+        let R = 0;
+        for (let i = 0; i < body.n; i++) {
+            const x = body.pts[i * 3] * ks;
+            const y = body.pts[i * 3 + 1] * ks;
+            const z = body.pts[i * 3 + 2] * ks;
+            const vx = m[0] * x + m[3] * y + m[6] * z;
+            const vy = m[1] * x + m[4] * y + m[7] * z;
+            const vz = m[2] * x + m[5] * y + m[8] * z;
+            // viewer axes → game axes: x flips
+            out[i * 4] = p.x - vx;
+            out[i * 4 + 1] = p.y + vy;
+            out[i * 4 + 2] = p.z + vz;
+            out[i * 4 + 3] = rad;
+            R = Math.max(R, Math.hypot(vx, vy, vz) + rad);
+        }
+        bodyWorld.n = body.n;
+        bodyWorld.R = R;
+        return bodyWorld;
+    };
 
     const edge = { l: 0, r: 0, t: 0, b: 0 }; // pressing against the edge of the flying area
     const placePlayer = (z) => {
@@ -579,14 +613,15 @@ const createGame = () => {
         terrainCollide(inp, live);
         world.update(dt, p);
 
-        for (const ev of world.collide(p, p.inv > 0 || !live)) {
+        for (const ev of world.collide(p, p.inv > 0 || !live, updateBody())) {
             if (ev.type === 'hit') {
                 const r = ev.rock;
                 p.x += ev.nx * 2;
                 p.y += ev.ny * 2;
                 p.vx = ev.nx * 12;
                 p.vy = ev.ny * 9;
-                world.burst(p.x - ev.nx * PLAYER_PAD, p.y - ev.ny * PLAYER_PAD, p.z + 1.2, { sparks: 50, speed: 16, debris: 10 });
+                // sparks where it struck (taken before the push)
+                world.burst(ev.at[0], ev.at[1], ev.at[2], { sparks: 50, speed: 16, debris: 10 });
                 if (r.kind === 'meteor') {
                     // a meteor shatters
                     r.done = true;
@@ -881,6 +916,22 @@ const createGame = () => {
         world.fillBlobs(p, p.alive || game.state === 'title');
         updateCamera(dt);
         updateModel(dt);
+        // once the model and its resting pose are known: its shape for hits
+        if (gsComp && base && bodyState === 'none') {
+            bodyState = 'building';
+            buildBody(gsComp, base, game.model.center)
+                .then((b) => {
+                    body = b;
+                    bodyState = b ? 'ready' : 'failed';
+                })
+                .catch(() => {
+                    bodyState = 'failed';
+                });
+        }
+        if (HITBOX && body && splat?.enabled) {
+            const b = updateBody();
+            for (let i = 0; i < b.n; i++) world.sparks.emit(b.pts[i * 4], b.pts[i * 4 + 1], b.pts[i * 4 + 2], 0, 0, 0, 0.08, b.pts[i * 4 + 3] * 1.6, b.pts[i * 4 + 3] * 1.6, 0.3, 1, 0.5, 0.8, 0, 0);
+        }
         updateFx(dt);
         updateLight(dtIn);
         if (game.state === 'gallery') placeGalleryLabels();
@@ -911,13 +962,14 @@ const createGame = () => {
     }
 
     game.tick = tick;
-    game.debug = { p, run, TUNE, light: SPLAT_LIGHT };
+    game.debug = { p, run, TUNE, light: SPLAT_LIGHT, body: () => ({ state: bodyState, n: body?.n ?? 0, world: updateBody() }) };
     game.attach = (a) => {
         app = a;
         camEntity = app.root.findComponents('camera')[0]?.entity ?? null;
         const gs = app.root.findComponents('gsplat')[0] ?? null;
         splat = gs?.entity ?? null;
         if (gs) light.attach(gs);
+        gsComp = gs;
         const b = readBounds(app);
         if (b) {
             game.model.center = b.center;

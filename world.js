@@ -29,7 +29,9 @@ export const SIZE_CLASSES = {
     large: { name: '大', k: [1.15, 1.9], types: ['potato', 'binary', 'long', 'slab', 'crater', 'rubble'] },
     giant: { name: '巨大岩', k: [2.4, 3.3], types: ['rubble', 'slab', 'binary', 'long', 'potato'] }
 };
-const HIT_SHRINK = 0.9; // 見た目の表面より少し内側で当たる（デコボコの先端はかすめても平気）
+const HIT_SHRINK = 0.92; // 見た目の表面より少し内側で当たる（デコボコの先端はかすめても平気）
+// 岩の表面を探す方向: 岩の中心から自機の向きと、そのまわりの扇（角度[rad], 本数）
+const HIT_FAN = [[0, 1], [0.18, 6], [0.4, 8], [0.7, 8], [1.0, 8]];
 
 export const RING_STEP = 2.0; // 地形の断面の間隔
 export const RING_COUNT = 168; // 保持する断面の数
@@ -927,21 +929,54 @@ export class World {
         return { k, l, ax, ay, az, minAxis: Math.min(ax, ay, az) };
     }
 
-    // a meteor or comet against a sphere of radius pad: how far the sphere is from touching its real
-    // shape (negative: touching). Measured along the ray from the rock's centre, then tilted by how
-    // much the surface leans there (so a long rock's sloping end is not given a wide margin)
+    // a meteor or comet against a ball of radius pad at (px, py, pz): how far apart their surfaces
+    // are (negative: touching). The rock's surface is looked up along the ray from its centre towards
+    // the ball and in a fan of directions round it; the nearest of those surface points counts
     clearance(r, px, py, pz, pad) {
+        const shape = this.shapes[r.variant];
         const l = qRot(r.q, px - r.x, py - r.y, pz - r.z, true);
-        const dist = Math.hypot(l[0], l[1], l[2]);
-        if (dist < 1e-6) return -pad;
-        const mx = l[0] / r.sx;
-        const my = l[1] / r.sy;
-        const mz = l[2] / r.sz;
+        const { sx, sy, sz } = r;
+        let mx = l[0] / sx;
+        let my = l[1] / sy;
+        let mz = l[2] / sz;
         const ml = Math.hypot(mx, my, mz);
-        const s = this.shapes[r.variant].sample(mx / ml, my / ml, mz / ml);
-        // the surface along this ray, in world units
-        const surf = (s.r * HIT_SHRINK * dist) / ml;
-        return (dist - surf) * s.lean - pad;
+        if (ml < 1e-6) return -pad - shape.maxR;
+        mx /= ml;
+        my /= ml;
+        mz /= ml;
+        // inside the rock along its own ray: touching
+        const r0 = shape.sample(mx, my, mz) * HIT_SHRINK;
+        if (ml < r0) return -pad - (r0 - ml) * Math.min(sx, sy, sz);
+        // two directions across the ray
+        const hx = Math.abs(mx) < 0.9 ? 1 : 0;
+        const hy = hx ? 0 : 1;
+        let ax = my * 0 - mz * hy;
+        let ay = mz * hx - mx * 0;
+        let az = mx * hy - my * hx;
+        const al = Math.hypot(ax, ay, az);
+        ax /= al;
+        ay /= al;
+        az /= al;
+        const bx = my * az - mz * ay;
+        const by = mz * ax - mx * az;
+        const bz = mx * ay - my * ax;
+        let best = Infinity;
+        for (const [ang, n] of HIT_FAN) {
+            const ca = Math.cos(ang);
+            const sa = Math.sin(ang);
+            for (let k = 0; k < n; k++) {
+                const phi = (k / n) * TAU + ang * 3;
+                const c = Math.cos(phi) * sa;
+                const s = Math.sin(phi) * sa;
+                const dx = mx * ca + ax * c + bx * s;
+                const dy = my * ca + ay * c + by * s;
+                const dz = mz * ca + az * c + bz * s;
+                const R = shape.sample(dx, dy, dz) * HIT_SHRINK;
+                const d = Math.hypot(dx * R * sx - l[0], dy * R * sy - l[1], dz * R * sz - l[2]);
+                if (d < best) best = d;
+            }
+        }
+        return best - pad;
     }
 
     // wall limits for the player's body at (y, z): [left, right] x
@@ -956,14 +991,19 @@ export class World {
         return [lo, hi];
     }
 
-    // rock collisions and near misses; returns events
-    collide(player, invulnerable) {
+    // rock collisions and near misses; returns events. body: the player's shape as balls
+    // { pts: [x, y, z, radius, ...] (game coordinates), n, R: how far it reaches from the player's
+    // centre }; without it, one ball of PLAYER_PAD
+    collide(player, invulnerable, body = null) {
         const out = [];
+        const pts = body ? body.pts : [player.x, player.y, player.z, PLAYER_PAD];
+        const n = body ? body.n : 1;
+        const reachB = body ? body.R : PLAYER_PAD;
         for (const r of this.rocks) {
             if (r.done) continue;
             // how far the rock reaches along z
             const zr = r.kind === 'bridge' ? r.sz : r.kind === 'pillar' ? Math.max(r.sx, r.sz) : r.reach;
-            if (Math.abs(r.z - player.z) > zr + PLAYER_PAD + 1) {
+            if (Math.abs(r.z - player.z) > zr + reachB + 1) {
                 // passed: was it close?
                 if (!r.passed && r.z + zr < player.z) {
                     r.passed = true;
@@ -973,23 +1013,41 @@ export class World {
                 }
                 continue;
             }
-            let clear;
-            let g;
-            if (r.kind === 'meteor' || r.kind === 'comet') {
-                clear = this.clearance(r, player.x, player.y, player.z, PLAYER_PAD);
-                // pushed away from the rock's centre
-                g = [player.x - r.x, player.y - r.y];
-            } else {
-                const pr = World.probe(r, player.x, player.y, player.z, PLAYER_PAD);
-                clear = (pr.k - 1) * pr.minAxis;
-                // push out along the surface normal (in the world)
-                g = qRot(r.q, pr.l[0] / (pr.ax * pr.ax), pr.l[1] / (pr.ay * pr.ay), pr.l[2] / (pr.az * pr.az));
+            const solid = r.kind === 'meteor' || r.kind === 'comet';
+            let clear = Infinity;
+            let hit = null; // the ball nearest the rock
+            let grad = null;
+            for (let i = 0; i < n; i++) {
+                const x = pts[i * 4];
+                const y = pts[i * 4 + 1];
+                const z = pts[i * 4 + 2];
+                const pr = pts[i * 4 + 3];
+                let c;
+                if (solid) {
+                    // no closer than this: the rock reaches no further than r.reach from its centre
+                    const lb = Math.hypot(x - r.x, y - r.y, z - r.z) - pr - r.reach;
+                    if (lb >= clear || lb > 4.5) {
+                        if (lb < clear) clear = lb;
+                        continue;
+                    }
+                    c = this.clearance(r, x, y, z, pr);
+                } else {
+                    const pp = World.probe(r, x, y, z, pr);
+                    c = (pp.k - 1) * pp.minAxis;
+                    if (c < clear) grad = qRot(r.q, pp.l[0] / (pp.ax * pp.ax), pp.l[1] / (pp.ay * pp.ay), pp.l[2] / (pp.az * pp.az));
+                }
+                if (c < clear) {
+                    clear = c;
+                    hit = [x, y, z];
+                }
             }
             if (clear < r.minClear) r.minClear = clear;
-            if (clear < 0 && !r.hit && !invulnerable) {
+            if (clear < 0 && hit && !r.hit && !invulnerable) {
                 r.hit = true;
+                // pushed away from the rock's centre (a pillar or bridge: out along its surface)
+                const g = solid || !grad ? [hit[0] - r.x, hit[1] - r.y] : grad;
                 const gl = Math.hypot(g[0], g[1]);
-                out.push({ type: 'hit', rock: r, nx: gl > 1e-4 ? g[0] / gl : 0, ny: gl > 1e-4 ? g[1] / gl : 1 });
+                out.push({ type: 'hit', rock: r, nx: gl > 1e-4 ? g[0] / gl : 0, ny: gl > 1e-4 ? g[1] / gl : 1, at: hit });
             }
         }
         return out;
