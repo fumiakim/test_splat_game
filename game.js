@@ -621,7 +621,8 @@ const createGame = () => {
                 p.vx = ev.nx * 12;
                 p.vy = ev.ny * 9;
                 // sparks where it struck (taken before the push)
-                world.burst(ev.at[0], ev.at[1], ev.at[2], { sparks: 50, speed: 16, debris: 10 });
+                const at = ev.at ?? [p.x, p.y, p.z]; // (an older cached world.js gives no point)
+                world.burst(at[0], at[1], at[2], { sparks: 50, speed: 16, debris: 10 });
                 if (r.kind === 'meteor') {
                     // a meteor shatters
                     r.done = true;
