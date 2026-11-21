@@ -359,6 +359,7 @@ const createGame = () => {
     const rot = { q: [0, 0, 0, 1] };
     let time = 0;
     let camBlend = 0; // 0: the title view in front of the model, 1: chasing it from behind
+    let heading = 0; // the trench's direction where the player is (radians, + towards +x)
     let countdown = 0;
     let lastCount = 0;
     let stateT = 0;
@@ -711,7 +712,9 @@ const createGame = () => {
         const k = 1 - Math.exp(-dt * (scene === 'trench' ? TRENCH.steer ?? TUNE.steer : TUNE.steer));
         p.vx += (inp.x * latMax() - p.vx) * k;
         p.vy += (inp.y * TUNE.vertMax - p.vy) * k;
-        p.x += p.vx * dt;
+        // in the trench the model follows part of its bends by itself; the rest is the player's
+        p.follow = scene === 'trench' ? (TRENCH.follow ?? 0) * tr.slope(p.z) * p.speed : 0;
+        p.x += (p.vx + p.follow) * dt;
         p.y += p.vy * dt;
         const dz = p.speed * dt;
         p.z += dz;
@@ -801,6 +804,9 @@ const createGame = () => {
 
     const updateCamera = (dt) => {
         const c = TUNE.cam;
+        // which way the trench runs just ahead (0 elsewhere), eased so the view swings smoothly
+        const want = scene === 'trench' && world.track.slope ? Math.atan(world.track.slope(p.z + 10)) : 0;
+        heading += (want - heading) * (1 - Math.exp(-dt * 5));
         const t = TUNE.title;
         rail.x += (p.x - rail.x) * (1 - Math.exp(-dt * c.lagX));
         rail.y += (p.y - rail.y) * (1 - Math.exp(-dt * c.lagY));
@@ -816,18 +822,24 @@ const createGame = () => {
         const radius = lerp(t.radius, back, b);
         let ex = Math.sin(az) * radius + ox;
         let ey = lerp(t.up, c.up, b) + oy;
-        const ez = -Math.cos(az) * radius;
+        let ez = -Math.cos(az) * radius;
         let tx = ox * 0.55;
         const ty = lerp(t.lookUp, c.lookUp + oy * 0.5, b);
-        const tz = lerp(0, c.ahead, b);
-        // the trench: keep the camera inside it, and look a little the way it bends
+        let tz = lerp(0, c.ahead, b);
+        // the trench: the camera swings round with the trench's bends (from behind along it), stays
+        // inside it, and looks a little further the way it bends
         if (scene === 'trench') {
             const tr = world.track;
+            const hd = heading * b;
+            const ch = Math.cos(hd);
+            const sh = Math.sin(hd);
+            [ex, ez] = [ex * ch + ez * sh, -ex * sh + ez * ch];
+            [tx, tz] = [tx * ch + tz * sh, -tx * sh + tz * ch];
             const zc = p.z + ez;
             const cxC = tr.centerX(zc);
             const room = Math.abs(tr.wallX(1, p.y + ey, zc) - cxC) - 1.2;
             ex = clamp(p.x + ex, cxC - room, cxC + room) - p.x;
-            tx += (tr.centerX(p.z + tz) - p.x) * 0.3 * b;
+            tx += (tr.centerX(p.z + tz) - p.x - tx) * 0.15 * b;
         }
         if (shake > 0) {
             ex += shake * 0.3 * Math.sin(time * 53.1);
@@ -874,7 +886,8 @@ const createGame = () => {
         const lean = (lerp(TUNE.titleLean, TUNE.lean, b) + pose.sprint * 10 - vyn * TUNE.pitch) * DEG;
         pose.lean += (lean - pose.lean) * k;
         pose.bank += (vxn * TUNE.bank * DEG - pose.bank) * k;
-        pose.yaw += (-vxn * TUNE.yaw * DEG - pose.yaw) * k;
+        // turned the way the player slides, and (in the trench) along the trench itself
+        pose.yaw += (-vxn * TUNE.yaw * DEG - heading - pose.yaw) * k;
         pose.wobble = Math.max(0, pose.wobble - dt * 1.5);
         const wob = pose.wobble * 0.35 * Math.sin(time * 30);
         const bob = (1 - b) * 0.05 * Math.sin(time * 1.3);
@@ -910,7 +923,7 @@ const createGame = () => {
         fx.offset[0] = -p.x / R;
         fx.offset[1] = p.y / R;
         fx.offset[2] = p.z / R;
-        fx.vel[0] = p.vx;
+        fx.vel[0] = p.vx + (p.follow || 0);
         fx.vel[1] = -p.vy;
         fx.vel[2] = -p.speed;
         const flying = game.state === 'play' || game.state === 'countdown' || game.state === 'pause';

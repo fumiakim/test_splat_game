@@ -56,20 +56,22 @@ export const TRENCH = {
     every: [120, 75], // 障害物の間隔（単位）
     gap: 7.6, // 障害物の脇・上・下に必ず空ける幅（自機がバンクしても通れる）
     speed: [44, 66], // 前進速度（game.js が使う）。隕石帯は TUNE.speed
-    latMax: 30, // 左右の最高速度（隕石帯は 18）。急カーブを曲がりきれるように
+    latMax: 30, // 左右の最高速度（隕石帯は 18）
     steer: 8, // 操作への追従の速さ（隕石帯は 5.5）
+    follow: 0.55, // 溝の曲がりに自機がひとりでに沿う割合（残りは自分で操作）。カメラと機体の向きも溝に沿う
     // 急カーブ（溝が一気に横へずれる）と連続カーブ（左右に続けて曲がる）。最初の数回はゆるく、
     // 回を追って (curveRamp 回で) きつくなる。[ゆるいとき, きついとき] の範囲から選ぶ
-    curveGap: [[260, 520], [120, 300]], // 前のカーブとの間（単位）
-    sharpLen: [[110, 130], [80, 100]], // 急カーブの長さ
-    sharpShift: [[9, 12], [12, 16]], // 急カーブで横にずれる量
-    essesWave: [[190, 230], [140, 170]], // 連続カーブの 1 往復の長さ
-    essesAmp: [[5, 6.5], [6, 8.5]], // 連続カーブの振れ幅
-    curveSlope: 0.36, // カーブのいちばん急な所の傾き（横へ進む量 / 前へ進む量）の上限。最高速でも曲がりきれる
+    curveGap: [[300, 560], [160, 340]], // 前のカーブとの間（単位）
+    sharpLen: [[130, 170], [100, 130]], // 急カーブの長さ
+    sharpShift: [[16, 24], [24, 40]], // 急カーブで横にずれる量（溝の幅の 1〜2.5 倍）
+    essesWave: [[230, 290], [170, 220]], // 連続カーブの 1 往復の長さ
+    essesAmp: [[9, 12], [12, 18]], // 連続カーブの振れ幅
+    curveSlope: 0.65, // カーブのいちばん急な所の傾き（横へ進む量 / 前へ進む量、0.65 ≒ 33°）の上限
+    curveWiden: 1.2, // カーブの間、溝の幅の半分をこれだけ広げる
     curveCalm: 0.8, // カーブの間、ふだんのうねりをどれだけ止めるか（うねりを引き伸ばして、なめらかに）
     curveEase: 30, // ... その入り・抜けの長さ
-    curveRamp: 6,
-    curveWarn: 170 // カーブの手前、この距離で画面に予告を出す
+    curveRamp: 5,
+    curveWarn: 210 // カーブの手前、この距離で画面に予告を出す
 };
 const smoother = (t) => t * t * t * (t * (t * 6 - 15) + 10);
 // a curve's own sideways offset, t = 0..1 along it (a sharp one ends at its shift, the others at 0)
@@ -228,7 +230,7 @@ export class TrenchTrack {
                 // a sharp curve: the trench swerves aside and runs on from there; back towards the
                 // middle if it has wandered far
                 const shift = pick(T.sharpShift, ramp);
-                const sign = Math.abs(this.curveBase) > 30 ? -Math.sign(this.curveBase) : rnd() < 0.5 ? -1 : 1;
+                const sign = Math.abs(this.curveBase) > 50 ? -Math.sign(this.curveBase) : rnd() < 0.5 ? -1 : 1;
                 c = { kind: 'sharp', start, len: pick(T.sharpLen, ramp), shift: sign * shift, base: this.curveBase };
                 this.curveBase += c.shift;
             } else {
@@ -354,7 +356,7 @@ export class TrenchTrack {
     halfWidth(z) {
         const d = this.diff(z);
         const base = lerp(...TRENCH.halfWidth, d) + 0.8 * Math.sin((z / TRENCH.stretch) * 0.023 + this.ph[5]);
-        return lerp(base, lerp(...TRENCH.narrow, d), this.pinch(z));
+        return lerp(base, lerp(...TRENCH.narrow, d), this.pinch(z)) + TRENCH.curveWiden * this.inCurve(z);
     }
 
     // how far the upper wall stands back from the lower one
