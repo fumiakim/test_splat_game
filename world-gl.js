@@ -1,4 +1,4 @@
-// world-gl.js — 渓谷・岩（隕石・岩柱・岩橋）・火花の WebGL2 描画。
+// world-gl.js — 地形（渓谷・要塞の溝）・岩（隕石・岩柱・岩橋）・要塞の箱・火花の WebGL2 描画。
 //
 // space-fx.js の 2 枚のキャンバス（モデルより奥 = back / 手前 = front）それぞれに 1 つずつ作る。
 // どちらも同じ形を描き、モデル中心の深さ（uSplit）で前後に振り分ける。奥の層はビューアの
@@ -96,8 +96,85 @@ vec4 project(vec3 g, out float depth) {
 }
 `;
 
+// solid surfaces (terrain, rocks, boxes): which layer draws a fragment. With the model's body known
+// (uProxyOn), the back layer draws everything (under the splat) and the front layer draws only what is
+// in front of the body, pixel by pixel: uProxyDepth holds the depth of the body's balls (the same balls
+// the game hits with), so a wall or a block covers the model exactly where it is nearer than the model
+// there, and is covered by it where it is behind. Without it: split at the model's centre (otherLayer)
+const SOLID = `
+uniform float uProxyOn;
+uniform float uBodyR;     // how far the body reaches from its centre (view depth)
+uniform highp sampler2D uProxyDepth;
+bool solidHidden(float depth) {
+    if (uProxyOn < 0.5) return otherLayer(depth, 1.0);
+    if (uLayer < 0.5) return false;
+    // wholly behind the model: the back layer's copy is enough (no fading drawn twice)
+    if (depth > uSplit + uBodyR) return true;
+    float body = texelFetch(uProxyDepth, ivec2(gl_FragCoord.xy), 0).r;
+    return gl_FragCoord.z > body;
+}
+`;
+
 // fragment shaders only (screen-space derivatives)
 const FRAG = `
+// the fortress's hull plating: 4-unit cells, some split in two or four. Each panel stands proud or
+// sits sunk in (with a wide bevel, so the light catches one edge and the other falls in shade), some
+// carry a raised inner plate or a sunken frame, ribs or a vent; dark deep seams between; a rare small
+// lamp. uv: the surface's own two directions in world units. Returns the albedo; h: the height (for
+// bump, world units); lamp: the lamps' light
+vec3 plating(vec2 uv, float salt, out float h, out float lamp) {
+    vec2 c = uv / 4.0;
+    vec2 ci = floor(c);
+    vec2 cf = fract(c);
+    float r = hash13(vec3(ci, salt));
+    vec2 split = vec2(r > 0.45 ? 2.0 : 1.0, fract(r * 7.13) > 0.5 ? 2.0 : 1.0);
+    vec2 sc = cf * split;
+    vec2 si = floor(sc);
+    vec2 sf = fract(sc);
+    vec3 id = vec3(ci * 2.0 + si, salt + 3.0);
+    float tone = hash13(id);
+    float kind = hash13(id + 17.0);
+    vec2 size = 4.0 / split;
+    vec2 e = min(sf, 1.0 - sf) * size;
+    float edge = min(e.x, e.y);
+    float seam = 1.0 - smoothstep(0.05, 0.16, edge);
+    // proud, sunk or flush, over a bevel about a third of a unit wide
+    float raise = kind > 0.7 ? 0.55 : (kind < 0.22 ? -0.5 : 0.12);
+    h = raise * smoothstep(0.08, 0.42, edge);
+    float patchy = hash13(vec3(floor(uv / 13.0), salt + 9.0));
+    vec3 col = vec3(0.47, 0.49, 0.52) * mix(0.72, 1.12, tone) * mix(0.82, 1.06, patchy);
+    float inset = min(size.x, size.y) * 0.22;
+    if (kind > 0.3 && kind < 0.45) {
+        // a raised plate inside the panel
+        float inner = smoothstep(inset, inset + 0.18, edge);
+        h += 0.3 * inner;
+        col *= 1.0 + 0.08 * inner;
+    } else if (kind > 0.45 && kind < 0.58) {
+        // ribs across
+        float rib = abs(fract(sf.y * size.y / 0.45) - 0.5);
+        h += 0.16 * smoothstep(0.08, 0.28, rib);
+        col *= 0.86 + 0.14 * smoothstep(0.08, 0.3, rib);
+    } else if (kind > 0.58 && kind < 0.67) {
+        // a vent: a deep dark slot
+        float vent = step(abs(sf.x - 0.5) * size.x, size.x * 0.32) * step(abs(sf.y - 0.5) * size.y, size.y * 0.16);
+        col *= 1.0 - 0.7 * vent;
+        h -= 0.35 * vent;
+    } else if (kind > 0.67 && kind < 0.7) {
+        // a sunken frame round a flush centre
+        float frame = smoothstep(inset - 0.1, inset, edge) * (1.0 - smoothstep(inset + 0.15, inset + 0.25, edge));
+        h -= 0.25 * frame;
+        col *= 1.0 - 0.35 * frame;
+    }
+    // deep seams; sunken panels and slots darker inside (less light gets in)
+    h -= 0.3 * seam;
+    col *= 1.0 - 0.65 * seam;
+    col *= 1.0 - 0.3 * clamp(-h * 1.6, 0.0, 1.0);
+    lamp = 0.0;
+    if (hash13(id + 41.0) > 0.93) {
+        lamp = 1.0 - smoothstep(0.06, 0.12, length(sf * size - vec2(0.35)));
+    }
+    return col;
+}
 // small craters pitting a meteor: round each of a scatter of points (one per cell) a bowl with a
 // raised rim. The surface cuts the 3D balls at random heights, so the pits come in all sizes.
 // Returns the height (about -1 in a pit's middle, a little above 0 on its rim)
@@ -174,18 +251,55 @@ void main() {
 const TERRAIN_FS = `#version 300 es
 precision highp float;
 ${COMMON}
+${SOLID}
 ${FRAG}
 uniform vec4 uBlobs[${MAX_BLOBS}]; // x, z, radius, strength
 uniform int uBlobN;
+uniform float uStyle; // 0 canyon rock, 1 the fortress's metal plating
 in vec3 vPos;
 in vec3 vNormal;
 in vec2 vShade;
 in float vDepth;
 out vec4 outColor;
+float blobShadow(vec3 p) {
+    float blob = 1.0;
+    for (int i = 0; i < ${MAX_BLOBS}; i++) {
+        if (i >= uBlobN) break;
+        vec4 b = uBlobs[i];
+        float d = length(p.xz - b.xy) / b.z;
+        blob *= 1.0 - b.w * (1.0 - smoothstep(0.25, 1.0, d));
+    }
+    return blob;
+}
 void main() {
-    if (otherLayer(vDepth, 1.0)) discard;
+    if (solidHidden(vDepth)) discard;
     vec3 p = vPos;
     vec3 N0 = normalize(vNormal);
+    if (uStyle > 0.5) {
+        // the trench: plates on the floor and the top laid along x/z, on the walls along z/y, with
+        // deep grooves every few units up the walls and ribs along them
+        bool level = abs(N0.y) > 0.6;
+        float h;
+        float lamp;
+        vec3 alb = plating(level ? p.xz : vec2(p.z, p.y), level ? 1.0 : 2.0, h, lamp);
+        if (!level) {
+            float band = abs(fract(p.y / 6.5 + 0.5) - 0.5) * 6.5;
+            float groove = 1.0 - smoothstep(0.2, 0.55, band);
+            h -= 0.7 * groove;
+            alb *= 1.0 - 0.45 * groove;
+            float rib = abs(fract(p.z / 9.0) - 0.5) * 9.0;
+            float ribS = 1.0 - smoothstep(0.3, 0.6, rib);
+            h += 0.5 * ribS;
+            alb *= 1.0 + 0.12 * ribS;
+        }
+        vec3 N = bump(N0, p, h, 1.35 * (1.0 - smoothstep(40.0, 150.0, vDepth)));
+        alb *= alb;
+        vec3 light = lighting(N, vShade.y);
+        light *= mix(1.0, blobShadow(p), smoothstep(0.72, 0.95, N0.y));
+        vec3 col = alb * light * vShade.x + vec3(1.0, 0.8, 0.55) * lamp * 1.6;
+        outColor = finish(col, p);
+        return;
+    }
     // rock grain: finer across the layers than along them
     float n2;
     float h = rockNoise(p, vec3(0.42, 1.15, 0.42), n2);
@@ -199,14 +313,7 @@ void main() {
 
     vec3 light = lighting(N, vShade.y);
     // soft shadows straight down from the player and the rocks
-    float blob = 1.0;
-    for (int i = 0; i < ${MAX_BLOBS}; i++) {
-        if (i >= uBlobN) break;
-        vec4 b = uBlobs[i];
-        float d = length(p.xz - b.xy) / b.z;
-        blob *= 1.0 - b.w * (1.0 - smoothstep(0.25, 1.0, d));
-    }
-    light *= mix(1.0, blob, ground);
+    light *= mix(1.0, blobShadow(p), ground);
     outColor = finish(alb * light * vShade.x, p);
 }`;
 
@@ -217,13 +324,15 @@ layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec3 iPos;
 layout(location = 3) in vec3 iScale;
 layout(location = 4) in vec4 iQuat;
-layout(location = 5) in vec4 iExtra; // heat, sun visibility, seed, kind (0 meteor, 1 canyon rock, 2 comet)
+layout(location = 5) in vec4 iExtra; // heat, sun visibility, seed, kind (0 meteor, 1 canyon rock, 2 comet, 3 obstacle box, 4 decor box)
 layout(location = 6) in float aAO;   // how open the surface is to the sky (low in necks, cracks, craters)
 ${COMMON}
 out float vAO;
 out vec3 vPos;
 out vec3 vNormal;
 out vec3 vLocal;
+out vec3 vUnit;  // the mesh's own coordinates (a box: -1..1 on each axis)
+out vec3 vScale;
 out vec4 vExtra;
 out float vDepth;
 vec3 qrot(vec4 q, vec3 v) {
@@ -234,6 +343,8 @@ void main() {
     vPos = p;
     vNormal = qrot(iQuat, aNormal / iScale);
     vLocal = aPos * iScale;
+    vUnit = aPos;
+    vScale = iScale;
     vExtra = iExtra;
     vAO = aAO;
     gl_Position = project(p, vDepth);
@@ -242,18 +353,47 @@ void main() {
 const ROCK_FS = `#version 300 es
 precision highp float;
 ${COMMON}
+${SOLID}
 ${FRAG}
 in vec3 vPos;
 in vec3 vNormal;
 in vec3 vLocal;
+in vec3 vUnit;
+in vec3 vScale;
 in vec4 vExtra;
 in float vAO;
 in float vDepth;
 out vec4 outColor;
 void main() {
-    if (otherLayer(vDepth, 1.0)) discard;
+    if (solidHidden(vDepth)) discard;
     vec3 N0 = normalize(vNormal);
     float seed = vExtra.z * 61.0;
+    if (vExtra.w > 2.5) {
+        // a box of the fortress: plated like the trench, in its own frame (face by face)
+        vec3 a = abs(vUnit);
+        vec2 uv = a.x > 0.999 ? vLocal.zy : (a.y > 0.999 ? vLocal.xz : vLocal.xy);
+        float h;
+        float lamp;
+        vec3 alb = plating(uv + vExtra.z * 37.0, 5.0, h, lamp);
+        vec3 N = bump(N0, vPos, h, 1.2 * (1.0 - smoothstep(40.0, 150.0, vDepth)));
+        alb *= alb * (vExtra.w > 3.5 ? 0.85 : 1.0);
+        // darker low down, where it meets what it stands on
+        float low = 0.6 + 0.4 * smoothstep(-1.0, -0.2, vUnit.y);
+        vec3 col = alb * lighting(N, vExtra.y) * low + vec3(1.0, 0.8, 0.55) * lamp * 1.6;
+        if (vExtra.w < 3.5) {
+            // an obstacle: amber light round the face that meets the player, so its edges (and the
+            // opening beside them) read at speed
+            float toFront = (vUnit.z + 1.0) * vScale.z;
+            vec2 across = vec2((1.0 - a.x) * vScale.x, (1.0 - a.y) * vScale.y);
+            float onFront = step(0.999, -vUnit.z);
+            float edge = onFront > 0.5 ? min(across.x, across.y) : toFront;
+            float strip = 1.0 - smoothstep(0.12, 0.3, edge);
+            float pulse = 0.8 + 0.2 * sin(uTime * 5.0 + seed);
+            col += vec3(1.0, 0.5, 0.12) * strip * 2.2 * pulse;
+        }
+        outColor = finish(col, vPos);
+        return;
+    }
     bool canyon = vExtra.w > 0.5 && vExtra.w < 1.5;
     bool comet = vExtra.w > 1.5;
     // canyon rock is textured in the world like the walls; meteors in their own frame, so the
@@ -309,6 +449,45 @@ void main() {
         col += vec3(0.35, 0.5, 0.65) + vec3(1.4, 1.8, 2.2) * c + vec3(0.9, 1.4, 2.0) * fres;
     }
     outColor = finish(col, vPos);
+}`;
+
+// the model's body as depth: each of its balls a sphere facing the camera, writing the depth of its
+// front surface (drawn a little larger than it is, so the splat's soft edge is not cut by what is behind)
+const PROXY_VS = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in vec4 iBall; // x, y, z, radius (game coordinates)
+uniform mat4 uGameView;
+uniform vec4 uProj;
+uniform float uInflate;
+out vec2 vUv;
+out vec3 vC;
+out float vR;
+void main() {
+    vec4 v = uGameView * vec4(iBall.xyz, 1.0);
+    float r = iBall.w * uInflate;
+    vC = v.xyz;
+    vR = r;
+    vUv = aCorner;
+    vec3 q = v.xyz + vec3(aCorner * r * 1.15, 0.0);
+    float d = -q.z;
+    gl_Position = d < 0.06 ? vec4(2.0, 2.0, 2.0, 1.0) : vec4(uProj.x * q.x, uProj.y * q.y, uProj.z * d + uProj.w, d);
+}`;
+
+const PROXY_FS = `#version 300 es
+precision highp float;
+uniform vec4 uProj;
+in vec2 vUv;
+in vec3 vC;
+in float vR;
+out vec4 outColor;
+void main() {
+    vec2 uv = vUv * 1.15;
+    float q = dot(uv, uv);
+    if (q > 1.0) discard;
+    float d = max(-vC.z - sqrt(1.0 - q) * vR, 0.06);
+    gl_FragDepth = (uProj.z + uProj.w / d) * 0.5 + 0.5;
+    outColor = vec4(0.0);
 }`;
 
 const SPARK_VS = `#version 300 es
@@ -432,6 +611,31 @@ void main() {
 
 let rockMeshes = null; // shared by both canvases (built once)
 
+// a unit box (-1..1), flat faces: the fortress's blocks
+const buildBoxMesh = () => {
+    const F = ROCK_VERT_FLOATS;
+    const faces = [
+        [[1, 0, 0], [0, 0, 1], [0, 1, 0]],
+        [[-1, 0, 0], [0, 0, -1], [0, 1, 0]],
+        [[0, 1, 0], [1, 0, 0], [0, 0, 1]],
+        [[0, -1, 0], [1, 0, 0], [0, 0, -1]],
+        [[0, 0, 1], [-1, 0, 0], [0, 1, 0]],
+        [[0, 0, -1], [1, 0, 0], [0, 1, 0]]
+    ];
+    const data = new Float32Array(24 * F);
+    const index = [];
+    faces.forEach(([n, u, v], f) => {
+        const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+        corners.forEach(([a, b], k) => {
+            const p = [n[0] + u[0] * a + v[0] * b, n[1] + u[1] * a + v[1] * b, n[2] + u[2] * a + v[2] * b];
+            data.set([...p, ...n, 1], (f * 4 + k) * F);
+        });
+        const o = f * 4;
+        index.push(o, o + 1, o + 2, o, o + 2, o + 3);
+    });
+    return { data, index: new Uint16Array(index) };
+};
+
 // ---------------------------------------------------------------------------------------------
 
 export class WorldGL {
@@ -459,8 +663,10 @@ export class WorldGL {
             }
             return { prog, u };
         };
-        this.terrain = link(TERRAIN_VS, TERRAIN_FS, ['uBlobs', 'uBlobN']);
-        this.rock = link(ROCK_VS, ROCK_FS);
+        const SOLID_U = ['uProxyOn', 'uBodyR', 'uProxyDepth'];
+        this.terrain = link(TERRAIN_VS, TERRAIN_FS, ['uBlobs', 'uBlobN', 'uStyle', ...SOLID_U]);
+        this.rock = link(ROCK_VS, ROCK_FS, SOLID_U);
+        this.proxy = link(PROXY_VS, PROXY_FS, ['uInflate']);
         this.spark = link(SPARK_VS, SPARK_FS);
         this.tail = link(TAIL_VS, TAIL_FS, ['uViewport']);
 
@@ -494,7 +700,7 @@ export class WorldGL {
         gl.bindVertexArray(null);
 
         // rocks: instanced meshes, one per shape (rock-shapes.js)
-        if (!rockMeshes) rockMeshes = getRockShapes();
+        if (!rockMeshes) rockMeshes = [...getRockShapes(), buildBoxMesh()];
         this.rocks = rockMeshes.map((mesh) => {
             const vao = gl.createVertexArray();
             gl.bindVertexArray(vao);
@@ -544,6 +750,26 @@ export class WorldGL {
         gl.vertexAttribDivisor(2, 1);
         gl.bindVertexArray(null);
 
+        // the model's body (balls) as depth, rendered into its own depth texture
+        this.proxyVao = gl.createVertexArray();
+        gl.bindVertexArray(this.proxyVao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        this.proxyInst = gl.createBuffer();
+        this.proxyCap = 0;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.proxyInst);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
+        gl.vertexAttribDivisor(1, 1);
+        gl.bindVertexArray(null);
+        this.proxyTex = gl.createTexture();
+        this.proxyColor = gl.createRenderbuffer();
+        this.proxyFbo = gl.createFramebuffer();
+        this.proxySize = [0, 0];
+        this.proxyOk = true;
+        this.sizeProxy(1, 1);
+
         // comet tails: the same quad corners, one instance per tail
         this.tailVao = gl.createVertexArray();
         gl.bindVertexArray(this.tailVao);
@@ -592,14 +818,16 @@ export class WorldGL {
         gl.uniform1f(u.uTime, frame.time);
     }
 
-    drawTerrain(frame, world, layer) {
+    drawTerrain(frame, world, layer, proxyOn = false, body = null) {
         const { gl } = this;
         const t = world.terrain;
         const p = this.terrain;
         gl.useProgram(p.prog);
         this.setCommon(p, frame, layer);
+        this.setProxy(p, proxyOn, body);
         gl.uniform4fv(p.u.uBlobs, world.blobs);
         gl.uniform1i(p.u.uBlobN, world.blobCount);
+        gl.uniform1f(p.u.uStyle, world.mode === 'trench' ? 1 : 0);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.terrainVbo);
         const slotFloats = PROFILE_N * VERT_FLOATS;
         for (let s = 0; s < RING_COUNT; s++) {
@@ -615,22 +843,94 @@ export class WorldGL {
         if (newest > 0) gl.drawElements(gl.TRIANGLES, newest * ipp, gl.UNSIGNED_SHORT, 0);
     }
 
+    sizeProxy(w, h) {
+        const { gl } = this;
+        if (this.proxySize[0] === w && this.proxySize[1] === h) return;
+        this.proxySize = [w, h];
+        gl.bindTexture(gl.TEXTURE_2D, this.proxyTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, w, h, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, this.proxyColor);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, w, h);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.proxyFbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, this.proxyTex, 0);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, this.proxyColor);
+        this.proxyOk = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+
+    // the body's balls into the depth texture (front layer only)
+    drawProxy(frame, body) {
+        const { gl } = this;
+        const w = frame.vw;
+        const h = frame.vh;
+        this.sizeProxy(w, h);
+        if (!this.proxyOk) return false;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.proxyInst);
+        if (this.proxyCap < body.n) {
+            this.proxyCap = body.n;
+            gl.bufferData(gl.ARRAY_BUFFER, body.pts.byteLength, gl.DYNAMIC_DRAW);
+        }
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, body.pts, 0, body.n * 4);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.proxyFbo);
+        gl.viewport(0, 0, w, h);
+        gl.colorMask(false, false, false, false);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LESS);
+        gl.depthMask(true);
+        gl.clearDepth(1);
+        gl.clear(gl.DEPTH_BUFFER_BIT);
+        const p = this.proxy;
+        gl.useProgram(p.prog);
+        const n = LOOK.near;
+        const f = LOOK.far;
+        gl.uniformMatrix4fv(p.u.uGameView, false, frame.gameView);
+        gl.uniform4f(p.u.uProj, frame.p0, frame.p5, (f + n) / (f - n), (-2 * f * n) / (f - n));
+        gl.uniform1f(p.u.uInflate, 1.3);
+        gl.bindVertexArray(this.proxyVao);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, body.n);
+        gl.bindVertexArray(null);
+        gl.colorMask(true, true, true, true);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, w, h);
+        return true;
+    }
+
+    // the body's depth for the solid shaders
+    setProxy(p, on, body) {
+        const { gl } = this;
+        gl.activeTexture(gl.TEXTURE7);
+        gl.bindTexture(gl.TEXTURE_2D, this.proxyTex);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.uniform1i(p.u.uProxyDepth, 7);
+        gl.uniform1f(p.u.uProxyOn, on ? 1 : 0);
+        gl.uniform1f(p.u.uBodyR, body ? body.R + 0.5 : 0);
+    }
+
     // opaque: canyon and rocks (writes depth)
     drawSolid(frame, world, layer) {
         const { gl } = this;
+        // the model's body, when the game knows it: per-pixel cover between the model and the solids
+        const body = world.bodyProxy;
+        let proxyOn = !!(body && body.n);
+        if (proxyOn && layer > 0.5) proxyOn = this.drawProxy(frame, body);
         gl.enable(gl.DEPTH_TEST);
         gl.depthFunc(gl.LEQUAL);
         gl.depthMask(true);
         gl.disable(gl.BLEND);
         gl.disable(gl.CULL_FACE);
 
-        // canyon (only in canyon mode)
-        if (world.canyon) this.drawTerrain(frame, world, layer);
+        // the ground and walls (the canyon or the trench)
+        if (world.terrainOn) this.drawTerrain(frame, world, layer, proxyOn, body);
 
         // rocks
         const r = this.rock;
         gl.useProgram(r.prog);
         this.setCommon(r, frame, layer);
+        this.setProxy(r, proxyOn, body);
         for (let v = 0; v < ROCK_VARIANTS; v++) {
             const n = world.rockCount[v];
             if (!n) continue;

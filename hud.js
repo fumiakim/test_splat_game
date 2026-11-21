@@ -95,6 +95,16 @@ const CSS = `
 .mc-press.is-wait { animation: none; opacity: 0.6; cursor: default; }
 .mc-keys { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 18px; margin-top: 16px; font-size: 13px; color: #cfe0f5; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); }
 .mc-keys b { font-family: 'Orbitron', system-ui, sans-serif; font-weight: 500; color: #fff; margin-right: 6px; padding: 1px 7px; border: 1px solid rgba(255, 255, 255, 0.35); border-radius: 5px; font-size: 11px; }
+/* scene select on the title */
+.mc-scene { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 24px; }
+.mc-scene-btn { width: 40px; height: 40px; border-radius: 50%; border: 1px solid rgba(159, 212, 255, 0.55); background: rgba(6, 16, 44, 0.55);
+    color: #fff; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.mc-scene-btn:hover { background: rgba(40, 80, 150, 0.6); }
+.mc-scene-name { min-width: 11em; }
+.mc-scene-name b { display: block; font-size: clamp(17px, 2.4vw, 22px); font-weight: 700; letter-spacing: 0.24em; color: #fff; text-shadow: 0 1px 10px rgba(0, 0, 0, 0.8); }
+.mc-scene-name small { display: block; margin-top: 4px; font-family: 'Orbitron', system-ui, sans-serif; font-size: 11px; letter-spacing: 0.32em; color: var(--cyan); }
+.mc-scene-hint { margin-top: 8px; font-size: 12px; letter-spacing: 0.12em; color: #a9c4e6; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); }
+.mc-scene.is-fixed .mc-scene-btn, .mc-scene.is-fixed + .mc-scene-hint { visibility: hidden; }
 .mc-title-best { margin-top: 12px; font-size: 13px; letter-spacing: 0.24em; color: var(--accent); }
 .mc-result { margin-top: 18px; font-size: clamp(16px, 2.4vw, 22px); letter-spacing: 0.2em; }
 .mc-result b { display: block; font-size: clamp(44px, 8vw, 72px); font-weight: 900; letter-spacing: 0.06em; text-shadow: 0 0 22px rgba(120, 180, 255, 0.7); font-variant-numeric: tabular-nums; }
@@ -186,7 +196,13 @@ export const createHud = ({ touch, subtitle }) => {
         <div class="mc-screen mc-title">
             <div>
                 <div class="mc-logo">METEOR<br>CANYON</div>
-                <div class="mc-sub mc-jp">${subtitle}</div>
+                <div class="mc-sub mc-jp" data-k="subtitle">${subtitle}</div>
+                <div class="mc-scene" data-k="scene">
+                    <div class="mc-scene-btn" data-scene="-1" role="button" aria-label="前のシーン">◀</div>
+                    <div class="mc-scene-name mc-jp"><b data-k="scenename"></b><small data-k="sceneen"></small></div>
+                    <div class="mc-scene-btn" data-scene="1" role="button" aria-label="次のシーン">▶</div>
+                </div>
+                <div class="mc-scene-hint mc-jp">${touch ? '◀ ▶ でシーンを切り替え' : '← → でシーンを切り替え'}</div>
             </div>
             <div>
                 <div class="mc-press is-wait" data-k="press">LOADING…</div>
@@ -235,6 +251,13 @@ export const createHud = ({ touch, subtitle }) => {
         setReady(ready) {
             el.press.classList.toggle('is-wait', !ready);
             el.press.textContent = ready ? (touch ? 'TAP TO START' : 'PRESS SPACE TO START') : 'LOADING…';
+        },
+        // the scene shown on the title: { name, en, sub }, and whether it can be switched
+        setScene(s, canSwitch = true) {
+            el.scenename.textContent = s.name;
+            el.sceneen.textContent = s.en;
+            el.subtitle.textContent = s.sub;
+            el.scene.classList.toggle('is-fixed', !canSwitch);
         },
         setBest(best) {
             set('best', fmt(best));

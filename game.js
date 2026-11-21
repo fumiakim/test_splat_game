@@ -1,8 +1,10 @@
 // game.js — METEOR CANYON
 //
-// ガウシアンスプラットのガンプラを操り、隕石と彗星をかわしながら奥へ奥へと飛ぶ。
-// レースゲームのように、カメラは機体の後ろから進行方向（奥）を見る。
-// URL に ?canyon を付けると、渓谷（岩壁・岩柱・岩橋）の中を飛ぶ以前のモードになる。
+// ガウシアンスプラットのガンプラを操り、奥へ奥へと飛ぶ。レースゲームのように、カメラは機体の後ろから
+// 進行方向（奥）を見る。シーンはタイトル画面で切り替える（← → / ◀ ▶）:
+//   隕石帯   — 宇宙空間で隕石と彗星をかわす
+//   要塞の溝 — 巨大な宇宙要塞の表面の溝。曲がりくねって狭い溝を、壁や障害物に触れずに飛ぶ
+// URL に ?scene=trench / ?scene=space を付けるとそのシーンで始まる。?canyon は以前の渓谷モード。
 // URL に ?rocks を付けると、隕石の形と大きさの見本（ギャラリー）になる。Space / クリックでページ切り替え。
 //
 //   ← → / A D   左右        ↑ ↓ / W S   上下
@@ -46,12 +48,45 @@ const TUNE = {
     title: { az: 2.45, radius: 12.5, up: 0.9, lookUp: 0.3, fov: 46 }
 };
 
-const CANYON = new URL(location.href).searchParams.has('canyon');
-const GALLERY = new URL(location.href).searchParams.has('rocks');
-const HITBOX = new URL(location.href).searchParams.has('hitbox'); // 自機の当たり判定の球を光の点で見せる
-const SECTORS = CANYON
-    ? ['渓谷突入', '隕石帯', '岩柱の森', '天然の岩橋', '流星雨', '狭き峡谷', '深淵へ']
-    : ['隕石帯突入', '小惑星群', '彗星の通り道', '岩塊の嵐', '流星群', '深宇宙へ'];
+const PARAMS = new URL(location.href).searchParams;
+const GALLERY = PARAMS.has('rocks');
+const HITBOX = PARAMS.has('hitbox'); // 自機の当たり判定の球を光の点で見せる
+
+// the scenes: name on the title, subtitle, sector names
+const SCENES = {
+    space: {
+        name: '隕石帯',
+        en: 'ASTEROID FIELD',
+        sub: '隕石と彗星をかわして、どこまでも翔べ',
+        sectors: ['隕石帯突入', '小惑星群', '彗星の通り道', '岩塊の嵐', '流星群', '深宇宙へ']
+    },
+    trench: {
+        name: '要塞の溝',
+        en: 'FORTRESS TRENCH',
+        sub: '巨大要塞の溝を、壁に触れずに翔け抜けろ',
+        sectors: ['要塞外壁へ', '第一の溝', '狭窄区画', '梁の回廊', '蛇行区画', '隔壁地帯', '最深部へ']
+    },
+    canyon: {
+        name: '渓谷',
+        en: 'CANYON',
+        sub: '渓谷の岩壁と隕石をかわして、どこまでも翔べ',
+        sectors: ['渓谷突入', '隕石帯', '岩柱の森', '天然の岩橋', '流星雨', '狭き峡谷', '深淵へ']
+    }
+};
+const SCENE_ORDER = PARAMS.has('canyon') ? ['space', 'trench', 'canyon'] : ['space', 'trench'];
+const firstScene = () => {
+    if (GALLERY) return 'space';
+    if (PARAMS.has('canyon')) return 'canyon';
+    const s = PARAMS.get('scene');
+    if (s && SCENES[s]) return s;
+    try {
+        const v = localStorage.getItem('meteor-canyon-scene');
+        if (SCENE_ORDER.includes(v)) return v;
+    } catch {
+        // not remembered
+    }
+    return 'space';
+};
 
 const MODEL_FALLBACK = { center: [-0.0045, 0.071, 0.032], halfExt: [1.02, 1.48, 0.44] };
 const DEG = Math.PI / 180;
@@ -159,6 +194,11 @@ const createInput = (hud, onPress) => {
             onPress('KeyM');
             return;
         }
+        const sceneBtn = e.target.closest('[data-scene]');
+        if (sceneBtn) {
+            onPress(sceneBtn.dataset.scene === '-1' ? 'ScenePrev' : 'SceneNext');
+            return;
+        }
         if (e.target.closest('.mc-boost-btn')) {
             boostPtr = e.pointerId;
             hud.el.boostbtn.classList.add('is-down');
@@ -254,16 +294,18 @@ const createInput = (hud, onPress) => {
 
 // ---------------------------------------------------------------------------------------------
 
-const loadBest = () => {
+// best scores, one per scene (the asteroid field keeps the key it always had)
+const bestKey = (scene) => (scene === 'space' ? 'meteor-canyon-best' : `meteor-canyon-best-${scene}`);
+const loadBest = (scene) => {
     try {
-        return Number(localStorage.getItem('meteor-canyon-best')) || 0;
+        return Number(localStorage.getItem(bestKey(scene))) || 0;
     } catch {
         return 0;
     }
 };
-const saveBest = (v) => {
+const saveBest = (scene, v) => {
     try {
-        localStorage.setItem('meteor-canyon-best', String(Math.floor(v)));
+        localStorage.setItem(bestKey(scene), String(Math.floor(v)));
     } catch {
         // not remembered: fine
     }
@@ -271,9 +313,17 @@ const saveBest = (v) => {
 
 const createGame = () => {
     const touch = window.matchMedia?.('(hover: none)').matches || navigator.maxTouchPoints > 0;
-    const hud = createHud({ touch, subtitle: CANYON ? '渓谷の岩壁と隕石をかわして、どこまでも翔べ' : '隕石と彗星をかわして、どこまでも翔べ' });
+    let scene = firstScene();
+    const hud = createHud({ touch, subtitle: SCENES[scene].sub });
+    // (?.: right after an update a browser may still hold an older cached file for a few minutes)
+    hud.setScene?.(SCENES[scene], !GALLERY);
     const audio = createAudio();
-    const world = new World({ canyon: CANYON });
+    const world = new World({ mode: scene });
+    // the trench's measures (from world.js, through the world so a stale cached copy cannot break
+    // the import)
+    const TRENCH = world.trenchSpec ?? { floor: -9, depth: 26, ledge: 0.55, speed: [44, 66] };
+    // how fast the player can move sideways (quicker in the trench, where it flies faster)
+    const latMax = () => (scene === 'trench' ? TRENCH.latMax ?? TUNE.latMax : TUNE.latMax);
     const light = createSplatLight(); // the model's lighting (sun, thrusters, comets, hits)
 
     const fx = {
@@ -297,7 +347,7 @@ const createGame = () => {
         fx
     };
 
-    let best = loadBest();
+    let best = loadBest(scene);
     hud.setBest(best);
     hud.setMuted(audio.muted);
 
@@ -357,8 +407,8 @@ const createGame = () => {
     const placePlayer = (z) => {
         const tr = world.track;
         p.z = z;
-        p.x = CANYON ? tr.centerX(z + 25) : 0;
-        p.y = CANYON ? tr.floorY(z) + 6 : 0;
+        p.x = scene === 'space' ? 0 : tr.centerX(z + (scene === 'trench' ? 6 : 25));
+        p.y = scene === 'space' ? 0 : tr.floorY(z) + (scene === 'trench' ? 9 : 6);
         p.vx = 0;
         p.vy = 0;
         rail.x = p.x;
@@ -372,6 +422,23 @@ const createGame = () => {
         p.speed = 12;
     };
     newWorld();
+
+    // the title's scene select
+    const switchScene = (dir) => {
+        const i = SCENE_ORDER.indexOf(scene);
+        scene = SCENE_ORDER[(i + dir + SCENE_ORDER.length) % SCENE_ORDER.length];
+        try {
+            localStorage.setItem('meteor-canyon-scene', scene);
+        } catch {
+            // not remembered: fine
+        }
+        world.setMode(scene);
+        newWorld();
+        hud.setScene?.(SCENES[scene]);
+        best = loadBest(scene);
+        hud.setBest(best);
+        audio.beep(false);
+    };
 
     const setSplatVisible = (v) => {
         if (splat) splat.enabled = v;
@@ -474,7 +541,7 @@ const createGame = () => {
         const newRecord = run.score > best && run.score > 0;
         if (newRecord) {
             best = Math.floor(run.score);
-            saveBest(best);
+            saveBest(scene, best);
         }
         hud.gameOver({ score: run.score, best, newRecord, distM: (run.z1 - run.z0) * UNIT_M, nearMisses: run.near });
         setState('over');
@@ -488,8 +555,11 @@ const createGame = () => {
             case 'gallery':
                 if (go) showGallery((gallery.page + 1) % GALLERY_PAGES.length);
                 break;
+            case 'loading':
             case 'title':
-                if (go && app) startRun();
+                if (code === 'ScenePrev' || code === 'ArrowLeft' || code === 'KeyA') switchScene(-1);
+                else if (code === 'SceneNext' || code === 'ArrowRight' || code === 'KeyD') switchScene(1);
+                else if (go && app) startRun();
                 break;
             case 'over':
                 if (go && stateT > 0.8 && resetT <= 0) retry();
@@ -558,9 +628,45 @@ const createGame = () => {
         }
     };
 
+    // the trench: stay below its rim; its walls (and its floor) push back, and the walls hurt
+    const trenchCollide = (inp, damaging) => {
+        const tr = world.track;
+        const ceil = TRENCH.floor + TRENCH.depth - 4;
+        if (p.y > ceil) {
+            p.y = ceil;
+            if (p.vy > 0) p.vy = 0;
+        }
+        const b = updateBody();
+        const c = b ? world.trenchContact(b.pts, b.n) : world.trenchContact([p.x, p.y - 2, p.z, PLAYER_HALF_W, p.x, p.y + 1, p.z, PLAYER_HALF_W], 2);
+        if (c.floor > 0) {
+            p.y += c.floor;
+            if (p.vy < 0) p.vy = 0;
+            // skimming the floor: sparks off the plating
+            if (Math.random() < 0.6) {
+                world.sparks.emit(p.x + (Math.random() - 0.5) * 2, TRENCH.floor + 0.2, p.z + 0.5, (Math.random() - 0.5) * 6, 2 + Math.random() * 4, -p.speed * 0.25, 0.4, 0.15, 0.03, 1, 0.75, 0.4, 2.0, 9, 1.2);
+            }
+        }
+        if (c.left > 0 && c.right > 0) {
+            p.x = tr.centerX(p.z);
+            wallHit(c.left > c.right ? -1 : 1, damaging);
+        } else if (c.left > 0) {
+            p.x += c.left / c.cos + 0.25;
+            p.vx = Math.max(p.vx, 0) + 8;
+            wallHit(-1, damaging);
+        } else if (c.right > 0) {
+            p.x -= c.right / c.cos + 0.25;
+            p.vx = Math.min(p.vx, 0) - 8;
+            wallHit(1, damaging);
+        }
+    };
+
     const terrainCollide = (inp, damaging) => {
-        if (!CANYON) {
+        if (scene === 'space') {
             areaLimit();
+            return;
+        }
+        if (scene === 'trench') {
+            trenchCollide(inp, damaging);
             return;
         }
         const tr = world.track;
@@ -595,14 +701,15 @@ const createGame = () => {
     const fly = (dt, inp, live) => {
         const tr = world.track;
         const d = tr.diff(p.z);
-        const cruise = lerp(TUNE.speed[0], TUNE.speed[1], d);
+        const sp = scene === 'trench' ? TRENCH.speed : TUNE.speed;
+        const cruise = lerp(sp[0], sp[1], d);
         p.boosting = live && inp.boost && p.boost > (p.boosting ? 0.002 : TUNE.boostMin);
         p.boost = clamp(p.boost + (p.boosting ? -TUNE.boostDrain : TUNE.boostRegen) * dt, 0, 1);
         p.slow = Math.min(1, p.slow + dt * 0.45);
         const target = cruise * (p.boosting ? TUNE.boostMul : 1) * p.slow * (live ? 1 : 0.75);
         p.speed += (target - p.speed) * (1 - Math.exp(-dt * (p.boosting ? 2.2 : 1.2)));
-        const k = 1 - Math.exp(-dt * TUNE.steer);
-        p.vx += (inp.x * TUNE.latMax - p.vx) * k;
+        const k = 1 - Math.exp(-dt * (scene === 'trench' ? TRENCH.steer ?? TUNE.steer : TUNE.steer));
+        p.vx += (inp.x * latMax() - p.vx) * k;
         p.vy += (inp.y * TUNE.vertMax - p.vy) * k;
         p.x += p.vx * dt;
         p.y += p.vy * dt;
@@ -650,7 +757,8 @@ const createGame = () => {
             const sector = 1 + Math.floor((p.z - run.z0) / TUNE.sector);
             if (sector !== run.sector) {
                 run.sector = sector;
-                hud.banner(`SECTOR ${sector}`, SECTORS[Math.min(sector - 1, SECTORS.length - 1)]);
+                const names = SCENES[scene].sectors;
+                hud.banner(`SECTOR ${sector}`, names[Math.min(sector - 1, names.length - 1)]);
                 audio.beep(true);
             }
         }
@@ -661,8 +769,8 @@ const createGame = () => {
         const tr = world.track;
         p.speed += (speed - p.speed) * (1 - Math.exp(-dt * 1.2));
         p.z += p.speed * dt;
-        const tx = CANYON ? tr.centerX(p.z + 25) : 0;
-        const ty = (CANYON ? tr.floorY(p.z) + 6 : 0) + Math.sin(time * 0.9) * 0.5;
+        const tx = scene === 'space' ? 0 : tr.centerX(p.z + (scene === 'trench' ? 6 : 25));
+        const ty = (scene === 'space' ? 0 : tr.floorY(p.z) + (scene === 'trench' ? 9 : 6)) + Math.sin(time * 0.9) * 0.5;
         const nx = p.x + (tx - p.x) * (1 - Math.exp(-dt * 1.5));
         const ny = p.y + (ty - p.y) * (1 - Math.exp(-dt * 2));
         if (dt > 0) {
@@ -676,6 +784,11 @@ const createGame = () => {
 
     const worldEvents = () => {
         for (const ev of world.events) {
+            if (ev.type === 'curve' && game.state === 'play') {
+                const arrow = ev.side < 0 ? '←' : '→';
+                hud.warn(ev.kind === 'sharp' ? `⚠ 急カーブ ${arrow}` : `⚠ 連続カーブ ${arrow} ×${ev.n}`);
+                audio.warn();
+            }
             if (ev.type === 'comet' && game.state === 'play') {
                 hud.warn(`⚠ 彗星接近 ${ev.side < 0 ? '←' : '→'}`);
                 audio.comet();
@@ -704,15 +817,24 @@ const createGame = () => {
         let ex = Math.sin(az) * radius + ox;
         let ey = lerp(t.up, c.up, b) + oy;
         const ez = -Math.cos(az) * radius;
-        const tx = ox * 0.55;
+        let tx = ox * 0.55;
         const ty = lerp(t.lookUp, c.lookUp + oy * 0.5, b);
         const tz = lerp(0, c.ahead, b);
+        // the trench: keep the camera inside it, and look a little the way it bends
+        if (scene === 'trench') {
+            const tr = world.track;
+            const zc = p.z + ez;
+            const cxC = tr.centerX(zc);
+            const room = Math.abs(tr.wallX(1, p.y + ey, zc) - cxC) - 1.2;
+            ex = clamp(p.x + ex, cxC - room, cxC + room) - p.x;
+            tx += (tr.centerX(p.z + tz) - p.x) * 0.3 * b;
+        }
         if (shake > 0) {
             ex += shake * 0.3 * Math.sin(time * 53.1);
             ey += shake * 0.3 * Math.sin(time * 61.7 + 1.3);
             shake = Math.max(0, shake - dt * 1.8);
         }
-        const roll = clamp(p.vx / TUNE.latMax, -1, 1) * 0.045 * b;
+        const roll = clamp(p.vx / latMax(), -1, 1) * 0.045 * b;
 
         let vfov = lerp(t.fov, c.fov + fast * 6 + pose.sprint * 8, b);
         // portrait screens: keep enough of the canyon in view sideways
@@ -745,7 +867,7 @@ const createGame = () => {
 
     const updateModel = (dt) => {
         const b = camBlend;
-        const vxn = clamp(p.vx / TUNE.latMax, -1, 1);
+        const vxn = clamp(p.vx / latMax(), -1, 1);
         const vyn = clamp(p.vy / TUNE.vertMax, -1, 1);
         const k = 1 - Math.exp(-dt * 5);
         pose.sprint += ((p.boosting ? 1 : 0) - pose.sprint) * (1 - Math.exp(-dt * 3));
@@ -875,7 +997,7 @@ const createGame = () => {
                     setState('play');
                     hud.count('GO!');
                     audio.beep(true);
-                    hud.banner('SECTOR 1', SECTORS[0]);
+                    hud.banner('SECTOR 1', SCENES[scene].sectors[0]);
                 }
                 break;
             }
@@ -929,18 +1051,19 @@ const createGame = () => {
                     bodyState = 'failed';
                 });
         }
+        // the body for drawing: walls and blocks cover the model exactly where they are nearer than it
+        world.bodyProxy = body && splat?.enabled && game.state !== 'gallery' ? updateBody() : null;
         if (HITBOX && body && splat?.enabled) {
             const b = updateBody();
-            for (let i = 0; i < b.n; i++) world.sparks.emit(b.pts[i * 4], b.pts[i * 4 + 1], b.pts[i * 4 + 2], 0, 0, 0, 0.08, b.pts[i * 4 + 3] * 1.6, b.pts[i * 4 + 3] * 1.6, 0.3, 1, 0.5, 0.8, 0, 0);
+            for (let i = 0; i < b.n; i++) world.sparks.emit(b.pts[i * 4], b.pts[i * 4 + 1], b.pts[i * 4 + 2], 0, 0, 0, 0.045, b.pts[i * 4 + 3] * 2.2, b.pts[i * 4 + 3] * 2.2, 0.3, 1, 0.5, 0.8, 0, 0);
         }
         updateFx(dt);
         updateLight(dtIn);
         if (game.state === 'gallery') placeGalleryLabels();
 
-        if (!CANYON) {
-            if (game.state !== 'play' && game.state !== 'countdown') edge.l = edge.r = edge.t = edge.b = 0;
-            hud.edges(edge);
-        }
+        if (scene !== 'space') edge.l = edge.r = edge.t = edge.b = 0;
+        if (game.state !== 'play' && game.state !== 'countdown') edge.l = edge.r = edge.t = edge.b = 0;
+        hud.edges(edge);
         white = Math.max(0, white - dtIn * 1.6);
         hud.white(Math.max(white, world.flash * 0.25));
         hud.update({

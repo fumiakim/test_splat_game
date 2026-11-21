@@ -3,8 +3,8 @@
 // ゲーム座標: x = 右, y = 上, z = 前（奥へ進む向き）。1 単位 ≒ 6 m（スキャンしたガンプラは約 3 単位）。
 // 描画は world-gl.js が、ここで作ったデータ（地形の頂点・岩のインスタンス・光の粒）をそのまま使う。
 //
-// ふだんは宇宙空間（隕石だけ）。プレイヤーは AREA の箱の中を動ける。URL に ?canyon を付けると
-// 以前の渓谷モード（地形・岩柱・岩橋あり）になる。
+// シーン（mode）: 'space' 宇宙空間の隕石帯（AREA の箱の中を動ける）、'trench' 巨大な宇宙要塞の表面に
+// 刻まれた溝（左右の壁と床、曲がりくねって狭い所が多い。障害物の箱）、'canyon' 以前の渓谷（?canyon）。
 
 import { mulberry32, noise3, fbm3 } from './noise.js';
 import { getRockShapes, pickShape, shapeIndex, SHAPE_TYPES, SHAPE_COUNT, PER_TYPE } from './rock-shapes.js';
@@ -29,7 +29,56 @@ export const SIZE_CLASSES = {
     large: { name: '大', k: [1.15, 1.9], types: ['potato', 'binary', 'long', 'slab', 'crater', 'rubble'] },
     giant: { name: '巨大岩', k: [2.4, 3.3], types: ['rubble', 'slab', 'binary', 'long', 'potato'] }
 };
-const HIT_SHRINK = 0.92; // 見た目の表面より少し内側で当たる（デコボコの先端はかすめても平気）
+// 難易度。[開始時, 最高難度] の組は、走った距離に応じて DIFF_DIST で最高難度に届く
+export const DIFF_DIST = 9000; // 最高難度までの距離（単位）。速さ（game.js の TUNE.speed）も同じ割合で上がる
+export const SPACE = {
+    grace: 150, // スタート直後、何も出てこない距離
+    perChunk: [1.7, 3.2], // 30 単位ごとの隕石の数（平均）
+    aimed: [0.32, 0.5], // そのうち自機のいるあたりを狙ってくる割合
+    drifting: [0.25, 0.6], // 横に流れていく割合
+    giantFrom: 450, // 巨大岩が出始める距離
+    swarmFrom: 700, // 小石の群れが出始める距離
+    swarm: [0.07, 0.18], // 30 単位ごとに群れが出る確率
+    cometFrom: 250, // 彗星が出始める距離
+    cometFirst: 10, // 最初の彗星までの秒数（の目安）
+    cometEvery: [13, 6.5] // 彗星の間隔（秒、±25%）
+};
+// 要塞の溝（mode 'trench'）
+export const TRENCH = {
+    depth: 26, // 溝の深さ（床から縁まで）
+    floor: -9, // 床の高さ
+    ledge: 0.55, // 壁の途中の段の高さ（深さに対する比）。段より上は溝が少し広い
+    halfWidth: [9.5, 7.6], // ふだんの溝の幅の半分（開始時 → 最高難度）
+    narrow: [5.4, 4.6], // 狭い所の幅の半分
+    wind: [0.65, 1.0], // 曲がりくねりの強さ
+    stretch: 1.6, // 曲がり・狭い所の間隔を何倍に引き伸ばすか（速く飛んでも曲がりきれるように）
+    grace: 350, // スタート直後、障害物のない距離
+    every: [120, 75], // 障害物の間隔（単位）
+    gap: 7.6, // 障害物の脇・上・下に必ず空ける幅（自機がバンクしても通れる）
+    speed: [44, 66], // 前進速度（game.js が使う）。隕石帯は TUNE.speed
+    latMax: 30, // 左右の最高速度（隕石帯は 18）。急カーブを曲がりきれるように
+    steer: 8, // 操作への追従の速さ（隕石帯は 5.5）
+    // 急カーブ（溝が一気に横へずれる）と連続カーブ（左右に続けて曲がる）。最初の数回はゆるく、
+    // 回を追って (curveRamp 回で) きつくなる。[ゆるいとき, きついとき] の範囲から選ぶ
+    curveGap: [[260, 520], [120, 300]], // 前のカーブとの間（単位）
+    sharpLen: [[110, 130], [80, 100]], // 急カーブの長さ
+    sharpShift: [[9, 12], [12, 16]], // 急カーブで横にずれる量
+    essesWave: [[190, 230], [140, 170]], // 連続カーブの 1 往復の長さ
+    essesAmp: [[5, 6.5], [6, 8.5]], // 連続カーブの振れ幅
+    curveSlope: 0.36, // カーブのいちばん急な所の傾き（横へ進む量 / 前へ進む量）の上限。最高速でも曲がりきれる
+    curveCalm: 0.8, // カーブの間、ふだんのうねりをどれだけ止めるか（うねりを引き伸ばして、なめらかに）
+    curveEase: 30, // ... その入り・抜けの長さ
+    curveRamp: 6,
+    curveWarn: 170 // カーブの手前、この距離で画面に予告を出す
+};
+const smoother = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+// a curve's own sideways offset, t = 0..1 along it (a sharp one ends at its shift, the others at 0)
+const curveOffset = (c, t) => {
+    if (c.kind === 'sharp') return c.shift * smoother(t);
+    const win = smooth01(t / 0.12) * smooth01((1 - t) / 0.12);
+    return c.amp * win * Math.sin(Math.PI * c.n * t);
+};
+const HIT_SHRINK = 0.97; // 隕石の見た目の表面より、ほんの少し内側で当たる（デコボコの先端はかすめても平気）
 // 岩の表面を探す方向: 岩の中心から自機の向きと、そのまわりの扇（角度[rad], 本数）
 const HIT_FAN = [[0, 1], [0.18, 6], [0.4, 8], [0.7, 8], [1.0, 8]];
 
@@ -42,9 +91,10 @@ const NW = 24; // 崖（片側）
 const NF = 13; // 谷底
 export const PROFILE_N = 2 * NP + 2 * NW + NF;
 
-export const ROCK_VARIANTS = SHAPE_COUNT; // 岩の形の数（形ごとにまとめて描く）
+export const BOX_VARIANT = SHAPE_COUNT; // 箱（要塞の溝の障害物と飾り）のメッシュの番号
+export const ROCK_VARIANTS = SHAPE_COUNT + 1; // 岩の形の数＋箱（形ごとにまとめて描く）
 export const ROCK_FLOATS = 14; // pos3 scale3 quat4 heat shadow seed -
-export const MAX_ROCKS = 160;
+export const MAX_ROCKS = 640;
 export const SPARK_FLOATS = 8; // pos3 size rgb intensity
 export const MAX_SPARKS = 4000;
 export const MAX_BLOBS = 16;
@@ -81,7 +131,7 @@ export class Track {
 
     // difficulty 0..1 by the distance flown in this run
     diff(z) {
-        return smooth01((z - this.z0) / 13000);
+        return smooth01((z - this.z0) / DIFF_DIST);
     }
 
     centerX(z) {
@@ -148,6 +198,241 @@ export class Track {
 }
 const MARCH = [3, 5, 8, 11.5, 16, 22, 29, 38, 49, 62];
 
+// the fortress trench: straight walls with a ledge part way up, a flat floor, a snaking line and
+// many narrow passes. The same questions as Track, so the terrain and the game use either
+export class TrenchTrack {
+    constructor(seed) {
+        this.seed = seed | 0;
+        const rnd = mulberry32(seed * 3 + 11);
+        this.ph = Array.from({ length: 10 }, () => rnd() * TAU);
+        this.z0 = Infinity;
+        this.trench = true;
+        // the curves, laid out as far ahead as anyone asks (from the seed alone, so the course is the
+        // same whatever the difficulty)
+        this.curves = [];
+        this.curveRnd = mulberry32(seed * 13 + 5);
+        this.curveEnd = 260;
+        this.curveBase = 0; // how far the sharp curves so far have moved the trench sideways
+    }
+
+    // lay out curves up to z
+    layCurves(z) {
+        const rnd = this.curveRnd;
+        const T = TRENCH;
+        const pick = (pair, ramp) => lerp(lerp(pair[0][0], pair[1][0], ramp), lerp(pair[0][1], pair[1][1], ramp), rnd());
+        while (this.curveEnd < z + 1) {
+            const ramp = Math.min(1, this.curves.length / T.curveRamp);
+            const start = this.curveEnd + pick(T.curveGap, ramp);
+            let c;
+            if (rnd() < 0.5) {
+                // a sharp curve: the trench swerves aside and runs on from there; back towards the
+                // middle if it has wandered far
+                const shift = pick(T.sharpShift, ramp);
+                const sign = Math.abs(this.curveBase) > 30 ? -Math.sign(this.curveBase) : rnd() < 0.5 ? -1 : 1;
+                c = { kind: 'sharp', start, len: pick(T.sharpLen, ramp), shift: sign * shift, base: this.curveBase };
+                this.curveBase += c.shift;
+            } else {
+                // consecutive curves: three to six bends, left and right
+                const n = 3 + Math.floor(rnd() * 4);
+                const wave = pick(T.essesWave, ramp);
+                c = { kind: 'esses', start, len: (n * wave) / 2, n, amp: (rnd() < 0.5 ? -1 : 1) * pick(T.essesAmp, ramp), base: this.curveBase };
+            }
+            // no steeper than curveSlope anywhere along it
+            let steep = 0;
+            for (let k = 0; k < 200; k++) steep = Math.max(steep, Math.abs(curveOffset(c, (k + 1) / 200) - curveOffset(c, k / 200)) * 200 / c.len);
+            if (steep > T.curveSlope) {
+                const f = T.curveSlope / steep;
+                if (c.kind === 'sharp') {
+                    this.curveBase -= c.shift * (1 - f);
+                    c.shift *= f;
+                } else c.amp *= f;
+            }
+            // how much "calm" the curves before this one added up to (see calmed())
+            const prev = this.curves[this.curves.length - 1];
+            c.area = prev ? prev.area + prev.len + T.curveEase : 0;
+            this.curves.push(c);
+            this.curveEnd = c.start + c.len;
+        }
+    }
+
+    // the index of the last curve starting at or before z + ahead (-1 if none)
+    curveIndex(z, ahead = 0) {
+        this.layCurves(z + ahead + 1);
+        const cs = this.curves;
+        let lo = 0;
+        let hi = cs.length - 1;
+        if (hi < 0 || cs[0].start > z + ahead) return -1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (cs[mid].start <= z + ahead) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo;
+    }
+
+    // the curve at z, or the last one before it (null before the first)
+    curveAt(z) {
+        const i = this.curveIndex(z);
+        return i < 0 ? null : this.curves[i];
+    }
+
+    // how much of a curve is under way at z (0..1): 1 inside one, easing in and out over curveEase
+    inCurve(z) {
+        const R = TRENCH.curveEase;
+        const i = this.curveIndex(z, R);
+        if (i < 0) return 0;
+        const c = this.curves[i];
+        if (z < c.start) return (z - (c.start - R)) / R;
+        if (z <= c.start + c.len) return 1;
+        return Math.max(0, 1 - (z - c.start - c.len) / R);
+    }
+
+    // z as the gentle winding sees it: it runs on at only (1 - curveCalm) the pace inside a curve, so
+    // the winding all but stops there, with no jump at either end (the area under inCurve, summed)
+    calmed(z) {
+        const R = TRENCH.curveEase;
+        const i = this.curveIndex(z, R);
+        if (i < 0) return z;
+        const c = this.curves[i];
+        const s = c.start;
+        const e = c.start + c.len;
+        let a;
+        if (z < s) a = (z - (s - R)) ** 2 / (2 * R);
+        else if (z < e) a = R / 2 + (z - s);
+        else if (z < e + R) a = R / 2 + c.len + (R / 2 - (e + R - z) ** 2 / (2 * R));
+        else a = c.len + R;
+        return z - TRENCH.curveCalm * (c.area + a);
+    }
+
+    // the next curve starting after z
+    nextCurve(z) {
+        this.layCurves(z + 600);
+        return this.curves.find((c) => c.start > z) ?? null;
+    }
+
+    // the curves' own sideways offset at z
+    curveX(z) {
+        const c = this.curveAt(z);
+        if (!c) return 0;
+        const t = (z - c.start) / c.len;
+        if (t >= 1) return c.base + (c.kind === 'sharp' ? c.shift : 0);
+        return c.base + curveOffset(c, t);
+    }
+
+    diff(z) {
+        return smooth01((z - this.z0) / DIFF_DIST);
+    }
+
+    centerX(z) {
+        const p = this.ph;
+        const amp = lerp(...TRENCH.wind, this.diff(z));
+        // the gentle winding (held almost still while a curve is under way), then the curves
+        const s = this.calmed(z) / TRENCH.stretch;
+        return amp * (16 * Math.sin(s * 0.015 + p[0]) + 5 * Math.sin(s * 0.036 + p[1]) + 10 * Math.sin(s * 0.0045 + p[2])) + this.curveX(z);
+    }
+
+    // how the line turns at z (x per unit of z)
+    slope(z) {
+        return this.centerX(z + 0.5) - this.centerX(z - 0.5);
+    }
+
+    floorY() {
+        return TRENCH.floor;
+    }
+
+    // 0..1: how much of a narrow pass there is at z
+    pinch(z) {
+        const p = this.ph;
+        const s = z / TRENCH.stretch;
+        const a = Math.max(0, Math.sin(s * 0.0105 + p[3]) - 0.6) / 0.4;
+        const b = Math.max(0, Math.sin(s * 0.025 + p[4]) - 0.75) / 0.25;
+        // no narrow passes in the middle of a curve
+        return smooth01(Math.max(a, b) * 1.7) * (1 - 0.85 * this.inCurve(z));
+    }
+
+    // half the width of the lower trench (below the ledge)
+    halfWidth(z) {
+        const d = this.diff(z);
+        const base = lerp(...TRENCH.halfWidth, d) + 0.8 * Math.sin((z / TRENCH.stretch) * 0.023 + this.ph[5]);
+        return lerp(base, lerp(...TRENCH.narrow, d), this.pinch(z));
+    }
+
+    // how far the upper wall stands back from the lower one
+    ledgeOut(z) {
+        return 1.6 + 0.6 * Math.sin((z / TRENCH.stretch) * 0.019 + this.ph[6]);
+    }
+
+    // the wall's x at game height y
+    wallX(side, y, z) {
+        const h = y - TRENCH.floor;
+        const w = this.halfWidth(z) + (h > TRENCH.depth * TRENCH.ledge ? this.ledgeOut(z) : 0);
+        return this.centerX(z) + side * w;
+    }
+
+    groundY() {
+        return TRENCH.floor;
+    }
+
+    floorDisp() {
+        return 0;
+    }
+
+    // the sun comes from up and to the left: is the point shaded by the trench wall on that side?
+    sunVis(x, y, z) {
+        let vis = 1;
+        for (const t of MARCH) {
+            const qx = x + SUN[0] * t;
+            const qy = y + SUN[1] * t;
+            const qz = z + SUN[2] * t;
+            const h = qy - TRENCH.floor;
+            if (h >= TRENCH.depth) break;
+            const cx = this.centerX(qz);
+            const room = Math.abs(this.wallX(qx > cx ? 1 : -1, qy, qz) - cx) - Math.abs(qx - cx);
+            vis = Math.min(vis, clamp(0.5 + room / 1.2, 0, 1));
+            if (vis <= 0) break;
+        }
+        return vis;
+    }
+
+    // one cross-section for the terrain: the top surface, the walls with their ledge, the floor
+    profile(z, P, AO) {
+        const D = TRENCH.depth;
+        const fy = TRENCH.floor;
+        const cx = this.centerX(z);
+        const hw = this.halfWidth(z);
+        const hu = hw + this.ledgeOut(z);
+        const hl = D * TRENCH.ledge;
+        const e = 0.06;
+        let j = 0;
+        const put = (side, out, h, ao) => {
+            P[j * 3] = cx + side * out;
+            P[j * 3 + 1] = fy + h;
+            P[j * 3 + 2] = z;
+            if (AO) AO[j] = ao;
+            j++;
+        };
+        // one wall from the top down: [outward, height], NW points
+        const wall = [];
+        wall.push([hu, D], [hu, D - e]);
+        for (let k = 1; k <= 9; k++) wall.push([hu, lerp(D - e, hl + e, k / 10)]);
+        wall.push([hu, hl + e], [hu, hl]);
+        wall.push([hw, hl], [hw, hl - e]);
+        for (let k = 1; k <= 7; k++) wall.push([hw, lerp(hl - e, e, k / 8)]);
+        wall.push([hw, e], [hw, 0]);
+        const wallAO = (out, h) => (out < hu - 0.01 ? 0.45 + 0.55 * smooth01(h / 7) : 0.7 + 0.3 * smooth01((h - hl) / 5));
+        const top = [[hu + 70, D], [hu + 22, D], [hu + e, D]];
+        for (let k = 0; k < NP; k++) put(-1, top[k][0], top[k][1], 1);
+        for (let k = 0; k < NW; k++) put(-1, wall[k][0], wall[k][1], wallAO(wall[k][0], wall[k][1]));
+        for (let k = 1; k <= NF; k++) {
+            const s = k === 1 ? 0.004 : k === NF ? 0.996 : (k - 1) / (NF - 1);
+            const x = lerp(-hw, hw, s);
+            put(1, x, 0, 0.45 + 0.55 * smooth01((hw - Math.abs(x)) / 4));
+        }
+        for (let k = NW - 1; k >= 0; k--) put(1, wall[k][0], wall[k][1], wallAO(wall[k][0], wall[k][1]));
+        for (let k = NP - 1; k >= 0; k--) put(1, top[k][0], top[k][1], 1);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // terrain: a ring buffer of cross-sections ahead of (and a little behind) the player
 
@@ -201,6 +486,10 @@ export class Terrain {
 
     profile(z, P, AO) {
         const t = this.track;
+        if (t.profile) {
+            t.profile(z, P, AO);
+            return;
+        }
         const cx = t.centerX(z);
         const fy = t.floorY(z);
         const hw = t.halfWidth(z);
@@ -408,11 +697,14 @@ export class Sparks {
 const CHUNK = 30; // obstacles are laid out chunk by chunk
 const SPAWN_AHEAD = 290;
 const GRACE = 320; // nothing in the way for the first stretch of a run
-const ROCK_KIND = { meteor: 0, pillar: 1, bridge: 1, comet: 2 }; // how world-gl.js shades each
+const ROCK_KIND = { meteor: 0, pillar: 1, bridge: 1, comet: 2, block: 3, deco: 4, greeble: 4 }; // how world-gl.js shades each
+const STRUCTURE = new Set(['block', 'deco', 'greeble']); // boxes of the fortress (greeble: parts on the trench walls)
 
 export class World {
-    constructor({ canyon = false } = {}) {
-        this.canyon = canyon;
+    constructor({ mode = 'space' } = {}) {
+        this.mode = mode;
+        this.trenchSpec = TRENCH; // for game.js
+        this.bodyProxy = null; // the player's body as balls, set by game.js each frame (for drawing)
         this.terrain = new Terrain();
         this.shapes = getRockShapes();
         this.sparks = new Sparks();
@@ -428,11 +720,26 @@ export class World {
         this.reset(1, 0);
     }
 
+    // the old canyon (?canyon)
+    get canyon() {
+        return this.mode === 'canyon';
+    }
+
+    // a scene with ground and walls (the canyon or the trench)
+    get terrainOn() {
+        return this.mode !== 'space';
+    }
+
+    // switch scenes; the game resets the world afterwards
+    setMode(mode) {
+        this.mode = mode;
+    }
+
     reset(seed, z) {
         this.seed = seed;
         this.rnd = mulberry32(seed * 7 + 3);
-        this.track = new Track(seed);
-        if (this.canyon) this.terrain.reset(this.track, z);
+        this.track = this.mode === 'trench' ? new TrenchTrack(seed) : new Track(seed);
+        if (this.terrainOn) this.terrain.reset(this.track, z);
         this.rocks.length = 0;
         this.sparks.clear();
         this.nextChunk = Math.floor(z / CHUNK) * CHUNK + CHUNK;
@@ -440,15 +747,24 @@ export class World {
         this.nextComet = Infinity;
         this.lastBridge = -Infinity;
         this.lastGiant = -Infinity;
+        this.nextObstacle = Infinity;
+        // the fortress's surface structures, laid out whether or not a run is on (also behind, for
+        // the title camera that looks back)
+        this.nextDeco = Math.floor((z - 240) / CHUNK) * CHUNK;
         this.time = 0;
+        if (this.mode === 'trench') this.spawnDecoUntil(z + SPAWN_AHEAD);
     }
 
     // a run starts here: the canyon's difficulty counts from this point, obstacles appear after a grace
     startRun(z) {
         this.track.z0 = z;
         this.spawning = true;
-        this.nextChunk = Math.floor((z + GRACE) / CHUNK) * CHUNK;
-        this.nextComet = this.time + 14;
+        const grace = this.mode === 'trench' ? TRENCH.grace : this.canyon ? GRACE : SPACE.grace;
+        this.nextChunk = Math.floor((z + grace) / CHUNK) * CHUNK;
+        this.nextComet = this.mode === 'trench' ? Infinity : this.time + (this.canyon ? 14 : SPACE.cometFirst);
+        this.nextObstacle = z + grace;
+        // no obstacles left over from the title's cruise in the way
+        this.rocks = this.rocks.filter((r) => r.kind === 'deco' || r.kind === 'greeble');
     }
 
     stopSpawning() {
@@ -458,6 +774,10 @@ export class World {
     // ---- spawning
 
     spawnChunk(zc, player) {
+        if (this.mode === 'trench') {
+            this.spawnTrench(zc);
+            return;
+        }
         const rnd = this.rnd;
         const tr = this.track;
         const d = tr.diff(zc);
@@ -486,7 +806,7 @@ export class World {
             return METEOR_R * k0 * Math.pow(k1 / k0, rnd()) * (1 + 0.1 * d);
         };
         const meteor = (o, cls, r = size(cls)) => {
-            const drifting = cls !== 'giant' && rnd() < lerp(0.15, 0.6, d);
+            const drifting = cls !== 'giant' && rnd() < (this.canyon ? lerp(0.15, 0.6, d) : lerp(...SPACE.drifting, d));
             const rock = this.addRock({
                 kind: 'meteor',
                 variant: pickShape(rnd, SIZE_CLASSES[cls].types),
@@ -509,18 +829,18 @@ export class World {
         if (!this.canyon) {
             // now and then a giant: slow, never drifting, seen from far off; the others keep clear of it
             let giant = null;
-            if (run > 700 && zc - this.lastGiant > 240 && rnd() < lerp(0.05, 0.09, d)) {
+            if (run > SPACE.giantFrom && zc - this.lastGiant > 240 && rnd() < lerp(0.05, 0.09, d)) {
                 giant = meteor({ x: (rnd() * 2 - 1) * AREA.x * 0.85, y: (rnd() * 2 - 1) * AREA.y * 0.8, z: zc + rnd() * CHUNK, spinRate: lerp(0.04, 0.12, rnd()) }, 'giant');
                 this.lastGiant = giant.z;
             }
             const clearOfGiant = (x, y, z, r) => !giant || Math.hypot(x - giant.x, y - giant.y, z - giant.z) > giant.reach + r * 1.6 + 2;
             // open space: meteors anywhere in (and a little beyond) the flying area; some on the
             // player's own line, so standing still is never safe
-            const n = poisson(lerp(0.9, 2.6, d));
+            const n = poisson(lerp(...SPACE.perChunk, d));
             for (let i = 0; i < n; i++) {
                 const cls = sizeClass();
                 const r = size(cls);
-                const aimed = rnd() < lerp(0.25, 0.45, d);
+                const aimed = rnd() < lerp(...SPACE.aimed, d);
                 const x = aimed ? player.x + (rnd() * 2 - 1) * 5 : (rnd() * 2 - 1) * (AREA.x + 4);
                 const y = aimed ? player.y + (rnd() * 2 - 1) * 4 : (rnd() * 2 - 1) * (AREA.y + 3);
                 const z = zc + rnd() * CHUNK;
@@ -538,7 +858,7 @@ export class World {
                 }
             }
             // now and then a swarm of small ones
-            if (run > 1200 && rnd() < lerp(0.05, 0.16, d)) {
+            if (run > SPACE.swarmFrom && rnd() < lerp(...SPACE.swarm, d)) {
                 const cx = (rnd() * 2 - 1) * AREA.x * 0.7;
                 const cy = (rnd() * 2 - 1) * AREA.y * 0.7;
                 const cz = zc + rnd() * CHUNK;
@@ -628,6 +948,152 @@ export class World {
         this.events.push({ type: 'comet', side });
     }
 
+    // ---- the trench
+
+    // a box standing square to the trench at z: lateral offset from the centre line, height of its
+    // centre above the floor, half sizes across / up / along
+    trenchBox(kind, z, across, h, hx, hy, hz) {
+        const tr = this.track;
+        const th = Math.atan(tr.slope(z));
+        const c = Math.cos(th);
+        const s = Math.sin(th);
+        return this.addRock({
+            kind,
+            variant: BOX_VARIANT,
+            x: tr.centerX(z) + across * c,
+            y: TRENCH.floor + h,
+            z: z - across * s,
+            sx: hx,
+            sy: hy,
+            sz: hz,
+            q: qAxis(0, 1, 0, th),
+            seed: this.rnd()
+        });
+    }
+
+    // obstacles in the trench, one every so often, never in a narrow pass. Each leaves an opening of
+    // at least TRENCH.gap beside, above or below it
+    spawnTrench(zc) {
+        const rnd = this.rnd;
+        const tr = this.track;
+        if (zc + CHUNK < this.nextObstacle) return;
+        const z = Math.max(zc, this.nextObstacle);
+        const d = tr.diff(z);
+        this.nextObstacle = z + lerp(...TRENCH.every, d) * lerp(0.8, 1.3, rnd());
+        const hw = Math.min(tr.halfWidth(z - 6), tr.halfWidth(z), tr.halfWidth(z + 6));
+        if (tr.pinch(z) > 0.05 || hw < TRENCH.gap * 0.5 + 2.5) return;
+        // not in a curve, nor just before or after one
+        if (Math.max(tr.inCurve(z - 40), tr.inCurve(z), tr.inCurve(z + 40)) > 0.05 || Math.abs(tr.slope(z)) > 0.22) return;
+        const D = TRENCH.depth;
+        const hl = D * TRENCH.ledge;
+        const hu = hw + tr.ledgeOut(z);
+        const gap = TRENCH.gap;
+        const run = z - tr.z0;
+        const len = lerp(2.5, 5, rnd()); // half its length along the trench
+        const side = rnd() < 0.5 ? -1 : 1;
+        const u = rnd();
+        if (u < 0.36) {
+            // a block jutting out of one wall, the whole height (or just the lower part)
+            const jut = Math.min(lerp(0.35, 0.65, rnd()) * 2 * hw, 2 * hw - gap);
+            const inner = hw - jut; // its face, from the centre line (on its own side)
+            const full = rnd() < 0.6;
+            const top = full ? D + 1 : lerp(hl * 0.6, hl, rnd());
+            const outer = (full ? hu : hw) + 1;
+            this.trenchBox('block', z, side * (inner + outer) / 2, top / 2 - 0.5, (outer - inner) / 2, top / 2 + 0.5, len);
+            // a lower block leaves room above it, a full one beside it
+        } else if (u < 0.6) {
+            // a beam across the trench: under it or over it
+            const t = lerp(1.2, 2.0, rnd());
+            const under = lerp(gap, D - 2 * t - gap - 1, rnd());
+            const half = (under + t > hl ? hu : hw) + 1;
+            this.trenchBox('block', z, 0, under + t, half, t, lerp(1.0, 2.0, rnd()));
+        } else if (u < 0.8) {
+            // a low wall across the floor: over it
+            const h = lerp(4, 9, rnd()) + 6 * d;
+            this.trenchBox('block', z, 0, h / 2 - 0.5, hw + 1, h / 2 + 0.5, len * 0.6);
+        } else if (run > 500) {
+            // a gate: blocks from both walls, a slot between them
+            const slot = lerp(gap, gap + 2.5, rnd());
+            const at = (rnd() * 2 - 1) * Math.max(0, hw - slot / 2 - 1.5);
+            const lo = at - slot / 2;
+            const hi = at + slot / 2;
+            const outer = hu + 1;
+            this.trenchBox('block', z, (-outer + lo) / 2, D / 2, (lo + outer) / 2, D / 2 + 1, len);
+            this.trenchBox('block', z, (hi + outer) / 2, D / 2, (outer - hi) / 2, D / 2 + 1, len);
+        } else {
+            const h = lerp(4, 8, rnd());
+            this.trenchBox('block', z, 0, h / 2 - 0.5, hw + 1, h / 2 + 0.5, len * 0.6);
+        }
+    }
+
+    // the trench walls' own relief: small blocks, pipes running along them and ribs up them, on the
+    // lower and the upper wall. They stand out at most about a unit (less in a narrow pass) and are
+    // as hard as the wall
+    spawnGreebles(zc, side) {
+        const rnd = this.rnd;
+        const tr = this.track;
+        const D = TRENCH.depth;
+        const hl = D * TRENCH.ledge;
+        for (const [lo, hi, upper] of [[0, hl, false], [hl, D, true]]) {
+            const n = 3 + Math.floor(rnd() * 4);
+            for (let i = 0; i < n; i++) {
+                const z = zc + rnd() * CHUNK;
+                const wall = tr.halfWidth(z) + (upper ? tr.ledgeOut(z) : 0);
+                const maxOut = tr.pinch(z) > 0.3 ? 0.45 : 0.95;
+                const u = rnd();
+                let hz;
+                let hy;
+                let out;
+                if (u < 0.45) {
+                    // a block
+                    hz = lerp(0.5, 1.8, rnd());
+                    hy = lerp(0.3, 1.5, rnd());
+                    out = lerp(0.3, maxOut, rnd());
+                } else if (u < 0.75) {
+                    // a pipe along the wall
+                    hz = lerp(2, 5, rnd());
+                    hy = lerp(0.15, 0.32, rnd());
+                    out = Math.min(lerp(0.3, 0.55, rnd()), maxOut);
+                } else {
+                    // a rib up the wall
+                    hz = lerp(0.2, 0.45, rnd());
+                    hy = Math.min(lerp(1.5, 4, rnd()), (hi - lo) / 2 - 0.3);
+                    out = lerp(0.3, Math.min(0.8, maxOut), rnd());
+                }
+                const y = lerp(lo + hy + 0.2, hi - hy - 0.2, rnd());
+                // set 0.3 into the wall, standing out by `out`
+                this.trenchBox('greeble', z, side * (wall + 0.15 - out / 2), y, (out + 0.3) / 2, hy, hz);
+            }
+        }
+    }
+
+    // blocks, towers and pipes on the fortress's surface beside the trench (only to look at: the
+    // player stays inside the trench), and the walls' own relief
+    spawnDecoUntil(zEnd) {
+        const rnd = this.rnd;
+        const tr = this.track;
+        const D = TRENCH.depth;
+        while (this.nextDeco < zEnd) {
+            const zc = this.nextDeco;
+            this.nextDeco += CHUNK;
+            for (const side of [-1, 1]) {
+                this.spawnGreebles(zc, side);
+                const n = 4 + Math.floor(rnd() * 5);
+                for (let i = 0; i < n; i++) {
+                    const z = zc + rnd() * CHUNK;
+                    const rim = tr.halfWidth(z) + tr.ledgeOut(z);
+                    const far = rnd();
+                    const off = rim + 0.3 + far * far * 26;
+                    const tall = far > 0.5 && rnd() < 0.25;
+                    const hx = lerp(0.6, 3.5, rnd());
+                    const hy = tall ? lerp(4, 10, rnd()) : lerp(0.3, 2.6, rnd());
+                    const hz = lerp(0.6, 4.5, rnd());
+                    this.trenchBox('deco', z, side * (off + hx), D + hy - 0.2, hx, hy, hz);
+                }
+            }
+        }
+    }
+
     // ?rocks: the shapes side by side (page 0) or the size classes (page 1), turning slowly in front
     // of the camera. Returns the labels to put under them
     gallery(page) {
@@ -686,9 +1152,9 @@ export class World {
             done: false,
             ...o
         };
-        rock.shadow = this.canyon ? this.track.sunVis(rock.x, rock.y + rock.sy * 0.3, rock.z) : 1;
+        rock.shadow = this.terrainOn ? this.track.sunVis(rock.x, rock.y + rock.sy * 0.3, rock.z) : 1;
         // how far from its centre the rock reaches (its shape's furthest point)
-        rock.reach = this.shapes[rock.variant].maxR * Math.max(rock.sx, rock.sy, rock.sz);
+        rock.reach = STRUCTURE.has(rock.kind) ? Math.hypot(rock.sx, rock.sy, rock.sz) : this.shapes[rock.variant].maxR * Math.max(rock.sx, rock.sy, rock.sz);
         this.rocks.push(rock);
         return rock;
     }
@@ -736,7 +1202,20 @@ export class World {
     update(dt, player) {
         this.time += dt;
         const tr = this.track;
-        if (this.canyon) this.terrain.update(player.z);
+        // what is kept behind the player: more while the title camera looks back along the course
+        const behind = this.terrainOn ? Math.max(40, this.terrain.behind * RING_STEP) : 40;
+        if (this.terrainOn) this.terrain.update(player.z);
+        if (this.mode === 'trench') {
+            this.spawnDecoUntil(player.z + SPAWN_AHEAD);
+            // a curve coming up: say so, and which way it goes first
+            if (this.spawning) {
+                const c = tr.nextCurve(player.z);
+                if (c && !c.warned && c.start - player.z < TRENCH.curveWarn) {
+                    c.warned = true;
+                    this.events.push({ type: 'curve', kind: c.kind, side: Math.sign(c.kind === 'sharp' ? c.shift : c.amp), n: c.n ?? 1 });
+                }
+            }
+        }
         this.flash = Math.max(0, this.flash - dt * 2.5);
 
         if (this.spawning) {
@@ -746,8 +1225,9 @@ export class World {
             }
             if (this.time >= this.nextComet) {
                 const d = tr.diff(player.z);
-                if (player.z - tr.z0 > 500) this.spawnComet(player);
-                this.nextComet = this.time + lerp(15, 7, d) * lerp(0.75, 1.25, this.rnd());
+                if (player.z - tr.z0 > (this.canyon ? 500 : SPACE.cometFrom)) this.spawnComet(player);
+                const every = this.canyon ? lerp(15, 7, d) : lerp(...SPACE.cometEvery, d);
+                this.nextComet = this.time + every * lerp(0.75, 1.25, this.rnd());
             }
         }
 
@@ -777,7 +1257,7 @@ export class World {
                 this.cometTail(r, dt);
                 if (Math.abs(r.x - player.x) > 300) r.done = true;
             }
-            if (r.z + r.sz < player.z - 40) r.done = true;
+            if (r.z + r.reach < player.z - behind) r.done = true;
         }
         this.rocks = this.rocks.filter((r) => !r.done);
         this.sparks.update(dt);
@@ -891,7 +1371,7 @@ export class World {
     fillBlobs(player, showPlayer) {
         const b = this.blobs;
         let n = 0;
-        if (!this.canyon) {
+        if (!this.terrainOn) {
             this.blobCount = 0;
             return;
         }
@@ -910,7 +1390,7 @@ export class World {
         };
         if (showPlayer) add(player.x, player.y, player.z, 1.5 * PLAYER_SCALE, 0.75);
         const near = this.rocks
-            .filter((r) => r.kind !== 'pillar' && r.kind !== 'bridge' && r.z > player.z - 10 && r.z < player.z + 140)
+            .filter((r) => r.kind !== 'pillar' && r.kind !== 'bridge' && !STRUCTURE.has(r.kind) && r.z > player.z - 10 && r.z < player.z + 140)
             .sort((p, q) => p.z - q.z);
         for (const r of near) add(r.x, r.y, r.z, r.sx * 1.15, r.kind === 'comet' ? 0.85 : 0.6);
         this.blobCount = n;
@@ -979,6 +1459,59 @@ export class World {
         return best - pad;
     }
 
+    // a box (block) against a ball: how far apart (negative: touching), and which way is out
+    static boxClear(r, x, y, z, pad) {
+        const l = qRot(r.q, x - r.x, y - r.y, z - r.z, true);
+        const qx = Math.abs(l[0]) - r.sx;
+        const qy = Math.abs(l[1]) - r.sy;
+        const qz = Math.abs(l[2]) - r.sz;
+        const ox = Math.max(qx, 0);
+        const oy = Math.max(qy, 0);
+        const oz = Math.max(qz, 0);
+        const out = Math.hypot(ox, oy, oz);
+        const m = Math.max(qx, qy, qz);
+        // the way out: towards the nearest face (inside) or straight away from the box (outside)
+        let n;
+        if (out > 0) n = [ox * Math.sign(l[0]), oy * Math.sign(l[1]), oz * Math.sign(l[2])];
+        else n = m === qx ? [Math.sign(l[0]), 0, 0] : m === qy ? [0, Math.sign(l[1]), 0] : [0, 0, Math.sign(l[2])];
+        return { c: out + Math.min(m, 0) - pad, n: qRot(r.q, n[0], n[1], n[2]) };
+    }
+
+    // the trench walls and floor against the player's balls: how far each pushes in (0 if clear)
+    // { left, right, floor } and the slope of the trench there
+    trenchContact(pts, n) {
+        const tr = this.track;
+        let left = 0;
+        let right = 0;
+        let floor = 0;
+        if (!n) return { left, right, floor, cos: 1 };
+        // the body spans a few units of z: the trench there, as straight lines from its middle
+        const z0 = pts[2];
+        const cx0 = tr.centerX(z0);
+        const slope = tr.slope(z0);
+        const hw0 = tr.halfWidth(z0);
+        const dhw = tr.halfWidth(z0 + 0.5) - tr.halfWidth(z0 - 0.5);
+        const lo = tr.ledgeOut(z0);
+        const hl = TRENCH.floor + TRENCH.depth * TRENCH.ledge;
+        const top = TRENCH.floor + TRENCH.depth;
+        const cos = 1 / Math.sqrt(1 + slope * slope);
+        for (let i = 0; i < n; i++) {
+            const x = pts[i * 4];
+            const y = pts[i * 4 + 1];
+            const z = pts[i * 4 + 2];
+            const r = pts[i * 4 + 3];
+            if (y > top) continue;
+            const dz = z - z0;
+            const cx = cx0 + slope * dz;
+            const half = hw0 + dhw * dz + (y > hl ? lo : 0);
+            // measured square to the wall, which runs at a slant
+            left = Math.max(left, r - (x - (cx - half)) * cos);
+            right = Math.max(right, r - (cx + half - x) * cos);
+            floor = Math.max(floor, r - (y - TRENCH.floor));
+        }
+        return { left, right, floor, cos };
+    }
+
     // wall limits for the player's body at (y, z): [left, right] x
     wallLimits(y, z) {
         const tr = this.track;
@@ -1000,7 +1533,7 @@ export class World {
         const n = body ? body.n : 1;
         const reachB = body ? body.R : PLAYER_PAD;
         for (const r of this.rocks) {
-            if (r.done) continue;
+            if (r.done || r.kind === 'deco') continue;
             // how far the rock reaches along z
             const zr = r.kind === 'bridge' ? r.sz : r.kind === 'pillar' ? Math.max(r.sx, r.sz) : r.reach;
             if (Math.abs(r.z - player.z) > zr + reachB + 1) {
@@ -1009,11 +1542,12 @@ export class World {
                     r.passed = true;
                     // comets count from further off: they are fast and bright
                     const near = r.kind === 'comet' ? 4 : 1.8;
-                    if (!r.hit && r.minClear < near && r.kind !== 'bridge') out.push({ type: 'near', rock: r, clear: r.minClear });
+                    if (!r.hit && r.minClear < near && r.kind !== 'bridge' && r.kind !== 'greeble') out.push({ type: 'near', rock: r, clear: r.minClear });
                 }
                 continue;
             }
             const solid = r.kind === 'meteor' || r.kind === 'comet';
+            const box = r.kind === 'block' || r.kind === 'greeble';
             let clear = Infinity;
             let hit = null; // the ball nearest the rock
             let grad = null;
@@ -1023,7 +1557,17 @@ export class World {
                 const z = pts[i * 4 + 2];
                 const pr = pts[i * 4 + 3];
                 let c;
-                if (solid) {
+                if (box) {
+                    // only contact matters for the walls' parts; near misses too for obstacles
+                    const lb = Math.hypot(x - r.x, y - r.y, z - r.z) - pr - r.reach;
+                    if (lb >= clear || lb > (r.kind === 'greeble' ? 0.3 : 2.0)) {
+                        if (lb < clear) clear = lb;
+                        continue;
+                    }
+                    const bc = World.boxClear(r, x, y, z, pr);
+                    c = bc.c;
+                    if (c < clear) grad = bc.n;
+                } else if (solid) {
                     // no closer than this: the rock reaches no further than r.reach from its centre
                     const lb = Math.hypot(x - r.x, y - r.y, z - r.z) - pr - r.reach;
                     if (lb >= clear || lb > 4.5) {
@@ -1045,7 +1589,7 @@ export class World {
             if (clear < 0 && hit && !r.hit && !invulnerable) {
                 r.hit = true;
                 // pushed away from the rock's centre (a pillar or bridge: out along its surface)
-                const g = solid || !grad ? [hit[0] - r.x, hit[1] - r.y] : grad;
+                const g = (solid || !grad) && !box ? [hit[0] - r.x, hit[1] - r.y] : grad;
                 const gl = Math.hypot(g[0], g[1]);
                 out.push({ type: 'hit', rock: r, nx: gl > 1e-4 ? g[0] / gl : 0, ny: gl > 1e-4 ? g[1] / gl : 1, at: hit });
             }
