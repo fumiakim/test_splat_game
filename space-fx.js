@@ -39,6 +39,7 @@ const CONFIG = {
     glowCover: 0.3, // 光のにじみが背景を覆う割合
     aperture: 0.022, // ボケの強さ（大きいほど手前/奥の粒が大きくボケる）
     particleSize: 0.5, // 光の粒（ボケ玉）の見た目の大きさの倍率（1 = 元の大きさ、0.5 = 半分）
+    particleOpacity: 0.55, // 光の粒（奥から流れてくる粒）の濃さ（1 = 元のまま、小さいほど透ける）。光の雲・星・炎は別
     maxSizeRatio: 0.2, // ボケ玉の最大直径（画面の高さに対する比）
     frontMaxSizeRatio: 0.12, // モデルより手前のボケ玉の最大直径
     frontBokeh: 0.35, // モデルより手前のボケ玉の明るさ（小さいほどモデルが見やすい）
@@ -378,6 +379,7 @@ uniform float uLayer;      // 0 back, 1 front
 uniform float uGain;
 uniform float uFrontBokeh;
 uniform float uCover;
+uniform float uParticleOpacity;
 uniform float uSoftness;
 uniform float uGlow;
 uniform float uHaze;
@@ -547,6 +549,7 @@ void main() {
             float spread = clamp(2.5 * sharp / D, 0.0, 1.0);
             intensity *= mix(1.0, (0.28 + 0.6 * spread) * (1.0 + 0.45 * uSoftness), blur);
             intensity *= mix(mix(0.3, 1.0, tw), mix(0.8, 1.0, tw), blur);
+            intensity *= uParticleOpacity;
 
             // keep clear of the model itself
             vec3 q = (world - uCenter) / uHalfExt;
@@ -603,7 +606,7 @@ void main() {
 
     vAlpha = intensity;
     vBlur = blur;
-    vCover = uCover * blur;
+    vCover = uCover * blur * uParticleOpacity; // blur is only ever set for the light particles
     if (beam) {
         gl_Position = beamPos;
         return;
@@ -777,7 +780,7 @@ class Layer {
         for (const name of [
             'uView', 'uProj', 'uCenter', 'uScale', 'uHalfExt', 'uTime', 'uViewport', 'uDpr',
             'uFocus', 'uBand', 'uAperture', 'uMaxSize', 'uParticleSize', 'uLayer', 'uGain', 'uFrontBokeh', 'uCover', 'uSoftness',
-            'uGlow', 'uHaze', 'uExposure', 'uHazeCover', 'uGlowCover', 'uSpeed', 'uFlame',
+            'uGlow', 'uHaze', 'uExposure', 'uParticleOpacity', 'uHazeCover', 'uGlowCover', 'uSpeed', 'uFlame',
             'uFlameScale', 'uOffset', 'uWrap', 'uModelRot', 'uPivot', 'uModelScale', 'uDepthAB', 'uVel', 'uShutter',
             'uCamPos', 'uOccN', 'uOccC', 'uOccU', 'uOccV', 'uOccW', 'uOccH'
         ]) {
@@ -869,6 +872,7 @@ class Layer {
         gl.uniform1f(u.uParticleSize, CONFIG.particleSize);
         gl.uniform1f(u.uFrontBokeh, CONFIG.frontBokeh);
         gl.uniform1f(u.uCover, CONFIG.cover);
+        gl.uniform1f(u.uParticleOpacity, CONFIG.particleOpacity);
         gl.uniform1f(u.uSoftness, CONFIG.softness);
         gl.uniform1f(u.uGlow, CONFIG.glow * (this.layerIndex ? CONFIG.frontGlow : 1));
         gl.uniform1f(u.uHaze, CONFIG.haze * frame.fade);

@@ -35,6 +35,7 @@ export const LOOK = {
     fogDist: 170,
     fadeStart: 230,
     fadeEnd: 292,
+    rockSaturation: 0.5, // 隕石の彩度（1 = 光の色そのまま、0 = 灰色）。熱で光るひび・彗星は別
     near: 0.1,
     far: 700
 };
@@ -290,6 +291,8 @@ void main() {
     float rim = pow(1.0 - max(dot(N0, V), 0.0), 3.0);
     // a cool rim of skylight, so a meteor stands out against the night sky
     if (!canyon) col += uSkyCol * 0.9 * rim * ao;
+    // meteors: less colour than the warm sun and the blue sky would give them
+    if (!canyon && !comet) col = mix(vec3(dot(col, vec3(0.2126, 0.7152, 0.0722))), col, ${LOOK.rockSaturation.toFixed(2)});
 
     // heat: glowing cracks and a hot rim
     if (heat > 0.0) {
