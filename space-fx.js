@@ -995,6 +995,8 @@ const mul4 = (a, b, out) => {
 // game: { camWorld, vfov, model: { center, halfExt }, fx: { offset, vel, rotMat, thrust, sprint, G,
 // camG, flash }, world } — read every frame
 export const createFx = (game) => {
+    // the calf nozzles, for the game's own use (splat-light.js lights the legs from them)
+    if (game.fx) game.fx.thrusters = CONFIG.thrusters;
     const params = new URL(location.href).searchParams;
     const style = document.createElement('style');
     style.textContent = `

@@ -18,7 +18,8 @@
 //  - 地形と岩は space-fx.js の 2 枚のキャンバス（モデルの奥と手前）に world-gl.js が描く。
 
 import { createFx, readBounds } from './space-fx.js';
-import { World, UNIT_M, MIN_ALT, MAX_ALT, RINGS_BEHIND, PLAYER_SCALE, PLAYER_HALF_W, PLAYER_PAD, AREA, qAxis, qMul } from './world.js';
+import { World, UNIT_M, MIN_ALT, MAX_ALT, RINGS_BEHIND, PLAYER_SCALE, PLAYER_HALF_W, PLAYER_PAD, AREA, SUN, qAxis, qMul } from './world.js';
+import { createSplatLight, SPLAT_LIGHT } from './splat-light.js';
 import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
 
@@ -271,6 +272,7 @@ const createGame = () => {
     const hud = createHud({ touch, subtitle: CANYON ? '渓谷の岩壁と隕石をかわして、どこまでも翔べ' : '隕石と彗星をかわして、どこまでも翔べ' });
     const audio = createAudio();
     const world = new World({ canyon: CANYON });
+    const light = createSplatLight(); // the model's lighting (sun, thrusters, comets, hits)
 
     const fx = {
         offset: new Float32Array(3), // how far the space has streamed past (viewer axes, model radii)
@@ -489,6 +491,7 @@ const createGame = () => {
         run.combo = 0;
         hud.hit();
         audio.hit();
+        light.hit();
         if (p.hp <= 0) die();
     };
 
@@ -764,6 +767,50 @@ const createGame = () => {
         fx.fadeRange[1] = lerp(190, 292, b);
     };
 
+    // the model's lighting: the meteors' sun, its own thrusters, the nearest comet
+    const updateLight = (dt) => {
+        const pivot = game.model.center;
+        const m = fx.rotMat;
+        const ks = fx.scale;
+        // a little below and behind each nozzle, where its jet is brightest; turned with the model
+        const jets = (fx.thrusters ?? []).map(({ pos }) => {
+            const d = [(pos[0] - pivot[0]) * ks, (pos[1] - pivot[1] - 0.1) * ks, (pos[2] - pivot[2] - 0.08) * ks];
+            return [
+                pivot[0] + m[0] * d[0] + m[3] * d[1] + m[6] * d[2],
+                pivot[1] + m[1] * d[0] + m[4] * d[1] + m[7] * d[2],
+                pivot[2] + m[2] * d[0] + m[5] * d[1] + m[8] * d[2]
+            ];
+        });
+        let comet = null;
+        let nearest = Infinity;
+        for (const r of world.rocks) {
+            if (r.kind !== 'comet') continue;
+            const dx = r.x - p.x;
+            const dy = r.y - p.y;
+            const dz = r.z - p.z;
+            const dist = Math.hypot(dx, dy, dz);
+            if (dist >= nearest) continue;
+            nearest = dist;
+            const [far, close] = SPLAT_LIGHT.cometRange;
+            // game → viewer axes: x flips
+            comet = { dir: [-dx, dy, dz], near: ease(clamp((far - dist) / (far - close), 0, 1)) };
+        }
+        const w = game.camWorld;
+        light.update({
+            dt,
+            time,
+            pivot,
+            cam: [w[12], w[13], w[14]],
+            sunDir: [-SUN[0], SUN[1], SUN[2]],
+            jets,
+            thrust: fx.thrust,
+            boost: pose.sprint,
+            scale: ks,
+            comet,
+            flash: world.flash
+        });
+    };
+
     // ---- the frame
 
     const tick = (dtIn) => {
@@ -835,6 +882,7 @@ const createGame = () => {
         updateCamera(dt);
         updateModel(dt);
         updateFx(dt);
+        updateLight(dtIn);
         if (game.state === 'gallery') placeGalleryLabels();
 
         if (!CANYON) {
@@ -863,11 +911,13 @@ const createGame = () => {
     }
 
     game.tick = tick;
-    game.debug = { p, run, TUNE };
+    game.debug = { p, run, TUNE, light: SPLAT_LIGHT };
     game.attach = (a) => {
         app = a;
         camEntity = app.root.findComponents('camera')[0]?.entity ?? null;
-        splat = app.root.findComponents('gsplat')[0]?.entity ?? null;
+        const gs = app.root.findComponents('gsplat')[0] ?? null;
+        splat = gs?.entity ?? null;
+        if (gs) light.attach(gs);
         const b = readBounds(app);
         if (b) {
             game.model.center = b.center;
