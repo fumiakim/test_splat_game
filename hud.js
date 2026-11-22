@@ -105,6 +105,8 @@ const CSS = `
 .mc-scene-name small { display: block; margin-top: 4px; font-family: 'Orbitron', system-ui, sans-serif; font-size: 11px; letter-spacing: 0.32em; color: var(--cyan); }
 .mc-scene-hint { margin-top: 8px; font-size: 12px; letter-spacing: 0.12em; color: #a9c4e6; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); }
 .mc-scene.is-fixed .mc-scene-btn, .mc-scene.is-fixed + .mc-scene-hint { visibility: hidden; }
+.mc-sound-hint { display: none; margin-top: 10px; font-size: 12px; letter-spacing: 0.06em; color: #ffd28a; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); }
+.mc-sound-hint.is-on { display: block; }
 .mc-title-best { margin-top: 12px; font-size: 13px; letter-spacing: 0.24em; color: var(--accent); }
 .mc-result { margin-top: 18px; font-size: clamp(16px, 2.4vw, 22px); letter-spacing: 0.2em; }
 .mc-result b { display: block; font-size: clamp(44px, 8vw, 72px); font-weight: 900; letter-spacing: 0.06em; text-shadow: 0 0 22px rgba(120, 180, 255, 0.7); font-variant-numeric: tabular-nums; }
@@ -151,6 +153,10 @@ export const createHud = ({ touch, subtitle }) => {
     const root = document.createElement('div');
     root.className = 'mc-hud' + (touch ? ' is-touch' : '');
     root.dataset.screen = 'loading';
+    const padHtml =
+        '<span><b>左スティック / 十字キー</b>移動</span><span><b>Ⓐ / RB / RT</b>ブースト（長押し）</span><span><b>START</b>ポーズ</span><span><b>BACK</b>音</span>';
+    let pad = false;
+    let hudReady = false;
     const keysHtml = touch
         ? '<span>画面をドラッグして移動</span><span><b>BOOST</b> ボタンで加速</span>'
         : '<span><b>← →</b>左右</span><span><b>↑ ↓</b>上下</span><span><b>SPACE</b>ブースト（長押し）</span><span><b>P</b>ポーズ</span><span><b>M</b>音</span>';
@@ -202,11 +208,12 @@ export const createHud = ({ touch, subtitle }) => {
                     <div class="mc-scene-name mc-jp"><b data-k="scenename"></b><small data-k="sceneen"></small></div>
                     <div class="mc-scene-btn" data-scene="1" role="button" aria-label="次のシーン">▶</div>
                 </div>
-                <div class="mc-scene-hint mc-jp">${touch ? '◀ ▶ でシーンを切り替え' : '← → でシーンを切り替え'}</div>
+                <div class="mc-scene-hint mc-jp" data-k="scenehint">${touch ? '◀ ▶ でシーンを切り替え' : '← → でシーンを切り替え'}</div>
             </div>
             <div>
                 <div class="mc-press is-wait" data-k="press">LOADING…</div>
-                <div class="mc-keys mc-jp">${keysHtml}</div>
+                <div class="mc-keys mc-jp" data-k="keys">${keysHtml}</div>
+                <div class="mc-sound-hint mc-jp" data-k="soundhint">🔈 音を出すには、一度クリックかキーを押してください（コントローラーのボタンでは音が鳴り始めません）</div>
                 <div class="mc-title-best" data-k="titlebest"></div>
             </div>
         </div>
@@ -217,11 +224,11 @@ export const createHud = ({ touch, subtitle }) => {
                 <div class="mc-newrec" data-k="newrec">NEW RECORD!</div>
                 <div class="mc-stats mc-jp" data-k="stats"></div>
             </div>
-            <div class="mc-press">${touch ? 'TAP' : 'PRESS SPACE'} TO RETRY</div>
+            <div class="mc-press" data-k="retry">${touch ? 'TAP' : 'PRESS SPACE'} TO RETRY</div>
         </div>
         <div class="mc-screen mc-pause">
             <div class="mc-logo is-small">PAUSED</div>
-            <div class="mc-press">${touch ? 'TAP' : 'P / SPACE'} TO RESUME</div>
+            <div class="mc-press" data-k="resume">${touch ? 'TAP' : 'P / SPACE'} TO RESUME</div>
         </div>
         <div class="mc-boost-btn" data-k="boostbtn">BOOST</div>
         <div class="mc-stick" data-k="stick"><i></i></div>
@@ -249,8 +256,23 @@ export const createHud = ({ touch, subtitle }) => {
             root.dataset.screen = name;
         },
         setReady(ready) {
+            hudReady = ready;
             el.press.classList.toggle('is-wait', !ready);
-            el.press.textContent = ready ? (touch ? 'TAP TO START' : 'PRESS SPACE TO START') : 'LOADING…';
+            el.press.textContent = ready ? (pad ? 'PRESS Ⓐ TO START' : touch ? 'TAP TO START' : 'PRESS SPACE TO START') : 'LOADING…';
+        },
+        // a game controller in use: its buttons in the hints (and back to the keys when it goes)
+        setPad(on) {
+            if (pad === on) return;
+            pad = on;
+            el.keys.innerHTML = on ? padHtml : keysHtml;
+            el.scenehint.textContent = on ? '十字キー ◀ ▶ / LB・RB でシーンを切り替え' : touch ? '◀ ▶ でシーンを切り替え' : '← → でシーンを切り替え';
+            el.retry.textContent = on ? 'PRESS Ⓐ TO RETRY' : `${touch ? 'TAP' : 'PRESS SPACE'} TO RETRY`;
+            el.resume.textContent = on ? 'START / Ⓐ TO RESUME' : `${touch ? 'TAP' : 'P / SPACE'} TO RESUME`;
+            this.setReady(hudReady);
+        },
+        // the browser will not start sound from a controller's button: ask for one click or key
+        setSoundHint(on) {
+            el.soundhint.classList.toggle('is-on', on);
         },
         // the scene shown on the title: { name, en, sub }, and whether it can be switched
         setScene(s, canSwitch = true) {

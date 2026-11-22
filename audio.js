@@ -180,6 +180,10 @@ export const createAudio = () => {
         get muted() {
             return muted;
         },
+        // whether sound is actually playing (a browser starts it only after a click or a key)
+        get running() {
+            return ctx?.state === 'running';
+        },
         // whether the recorded hit has loaded (for checking from the console)
         get sampleReady() {
             return !!impact;

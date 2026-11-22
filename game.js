@@ -10,7 +10,9 @@
 //   ← → / A D   左右        ↑ ↓ / W S   上下
 //   Space       ブースト（長押し。ゲージを使う）
 //   P / Esc     ポーズ       M   音のオン・オフ
-//   タッチ: 画面をドラッグして移動、BOOST ボタンで加速。ゲームパッドも使える。
+//   タッチ: 画面をドラッグして移動、BOOST ボタンで加速。
+//   ゲームコントローラー（標準配置）: 左スティック / 十字キーで移動、Ⓐ・RB・RT でブースト、START でポーズ、
+//   BACK で音、タイトルでは十字キー ◀ ▶ / LB・RB でシーン切り替え。当たると振動する。
 //
 // 仕組み
 //  - ビューア（index.js）はそのまま使い、毎フレームそのカメラをゲームが置き直す（app の 'update'
@@ -149,7 +151,9 @@ const createInput = (hud, onPress) => {
     const keys = new Set();
     const ptr = { id: null, x0: 0, y0: 0, x: 0, y: 0 };
     let boostPtr = null;
-    let padPrev = [false, false];
+    let padPrev = {};
+    let padIndex = -1; // the controller in use (for vibration)
+    let padSeen = 0; // when a controller last did anything (performance.now())
     let stickShown = false;
 
     window.addEventListener(
@@ -265,29 +269,56 @@ const createInput = (hud, onPress) => {
                 stickShown = false;
             }
 
+            // a game controller (standard mapping): the left stick with a round dead zone and a gentle
+            // curve (fine moves near the middle, full speed at the rim), the D-pad, buttons for boost,
+            // start, mute and, on the title, the scene
             const pads = navigator.getGamepads?.() ?? [];
             for (const pad of pads) {
-                if (!pad) continue;
-                const dz = (v) => (Math.abs(v) < 0.18 ? 0 : v);
-                const ax = dz(pad.axes[0] ?? 0);
-                const ay = dz(pad.axes[1] ?? 0);
-                if (ax || ay) {
-                    x = ax;
-                    y = -ay;
-                }
+                if (!pad || !pad.connected) continue;
+                const rx = pad.axes[0] ?? 0;
+                const ry = pad.axes[1] ?? 0;
+                const mag = Math.hypot(rx, ry);
                 const b = (i) => !!pad.buttons[i]?.pressed;
+                const anything = mag > 0.3 || pad.buttons.some((bt) => bt?.pressed);
+                if (anything) {
+                    padIndex = pad.index;
+                    padSeen = performance.now();
+                }
+                if (mag > 0.15) {
+                    const k = Math.pow(Math.min(1, (mag - 0.15) / 0.85), 1.5) / mag;
+                    x = clamp(rx * k, -1, 1);
+                    y = clamp(-ry * k, -1, 1);
+                }
                 if (b(14)) x = -1;
                 if (b(15)) x = 1;
                 if (b(12)) y = 1;
                 if (b(13)) y = -1;
-                if (b(0) || b(5) || b(7)) boost = true;
-                const now = [b(0), b(9)];
-                if (now[0] && !padPrev[0]) onPress('PadA');
-                if (now[1] && !padPrev[1]) onPress('PadStart');
-                padPrev = now;
+                if (b(0) || b(5) || b(7) || (pad.buttons[7]?.value ?? 0) > 0.3) boost = true;
+                // presses (on the moment a button goes down)
+                const edge = (name, down) => {
+                    if (down && !padPrev[name]) onPress(name);
+                    padPrev[name] = down;
+                };
+                edge('PadA', b(0));
+                edge('PadStart', b(9));
+                edge('KeyM', b(8));
+                edge('PadLeft', b(14) || b(4) || rx < -0.6);
+                edge('PadRight', b(15) || b(5) || rx > 0.6);
                 break;
             }
             return { x, y, boost };
+        },
+        // a controller has been used in the last minute
+        get padActive() {
+            return padIndex >= 0 && performance.now() - padSeen < 60000;
+        },
+        // shake the controller: strong (low motor) and weak (high motor) 0..1, for ms
+        rumble(strong, weak, ms) {
+            if (padIndex < 0) return;
+            const pad = (navigator.getGamepads?.() ?? [])[padIndex];
+            const act = pad?.vibrationActuator;
+            if (!act?.playEffect) return;
+            act.playEffect('dual-rumble', { startDelay: 0, duration: ms, strongMagnitude: strong, weakMagnitude: weak }).catch(() => {});
         }
     };
 };
@@ -534,6 +565,7 @@ const createGame = () => {
         white = 0.85;
         shake = 1.6;
         audio.explode();
+        input.rumble(1, 1, 700);
         setSplatVisible(false);
         setState('dying');
     };
@@ -558,8 +590,8 @@ const createGame = () => {
                 break;
             case 'loading':
             case 'title':
-                if (code === 'ScenePrev' || code === 'ArrowLeft' || code === 'KeyA') switchScene(-1);
-                else if (code === 'SceneNext' || code === 'ArrowRight' || code === 'KeyD') switchScene(1);
+                if (code === 'ScenePrev' || code === 'ArrowLeft' || code === 'KeyA' || code === 'PadLeft') switchScene(-1);
+                else if (code === 'SceneNext' || code === 'ArrowRight' || code === 'KeyD' || code === 'PadRight') switchScene(1);
                 else if (go && app) startRun();
                 break;
             case 'over':
@@ -598,6 +630,7 @@ const createGame = () => {
         hud.hit();
         if (!metal) audio.hit();
         light.hit();
+        input.rumble(0.9, 0.6, 260);
         if (p.hp <= 0) die();
     };
 
@@ -783,6 +816,7 @@ const createGame = () => {
                     r.done = true;
                     world.burst(r.x, r.y, r.z, { sparks: 90, speed: 24, debris: 26, fire: 34, flash: 20, color: [1, 0.55, 0.2] });
                     audio.boom(0);
+                    input.rumble(1, 0.8, 420);
                     shake = Math.max(shake, 1.3);
                 }
                 // the fortress's blocks and wall parts are metal
@@ -794,6 +828,7 @@ const createGame = () => {
                 const at = ev.at ?? [p.x, p.y, p.z];
                 world.burst(at[0], at[1], at[2], { sparks: 16, speed: 9, color: [1, 0.8, 0.5] });
                 grazeSound();
+                input.rumble(0.1, 0.4, 80);
             } else if (ev.type === 'near' && live && p.alive) {
                 run.combo = run.comboT > 0 ? Math.min(run.combo + 1, 9) : 1;
                 run.comboT = 4;
@@ -804,6 +839,7 @@ const createGame = () => {
                 run.near++;
                 hud.popup(`${comet ? 'COMET ' : mine ? 'MINE ' : ''}NEAR MISS +${pts}${run.combo > 1 ? `  ×${run.combo}` : ''}`);
                 audio.near(run.combo);
+                input.rumble(0, 0.25, 60);
             }
         }
 
@@ -1135,6 +1171,11 @@ const createGame = () => {
         if (scene !== 'space') edge.l = edge.r = edge.t = edge.b = 0;
         if (game.state !== 'play' && game.state !== 'countdown') edge.l = edge.r = edge.t = edge.b = 0;
         hud.edges(edge);
+        // the controller's buttons in the hints while one is in use; and the browser starts sound only
+        // after a click or a key, never a controller's button, so say so if that is all there has been
+        const padOn = input.padActive;
+        hud.setPad?.(padOn);
+        hud.setSoundHint?.(padOn && !audio.muted && !audio.running && (game.state === 'title' || game.state === 'loading'));
         white = Math.max(0, white - dtIn * 1.6);
         hud.white(Math.max(white, world.flash * 0.25));
         hud.update({
@@ -1157,7 +1198,7 @@ const createGame = () => {
     }
 
     game.tick = tick;
-    game.debug = { p, run, TUNE, light: SPLAT_LIGHT, body: () => ({ state: bodyState, n: body?.n ?? 0, world: updateBody() }) };
+    game.debug = { p, run, TUNE, input, light: SPLAT_LIGHT, body: () => ({ state: bodyState, n: body?.n ?? 0, world: updateBody() }) };
     game.attach = (a) => {
         app = a;
         camEntity = app.root.findComponents('camera')[0]?.entity ?? null;
