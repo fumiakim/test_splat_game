@@ -45,6 +45,7 @@ const TUNE = {
     bank: 34, // 左右移動中のバンク（度）
     yaw: 12, // 左右移動中に進む向きへ体をひねる（度）
     pitch: 14, // 上下移動中の前傾の増減（度）
+    spinTime: 0.75, // 被弾したときに機体が横に一回転する時間（秒）
     // カメラ（自機を PLAYER_SCALE 倍に描くので、それに合わせた距離）
     cam: { back: 10.5, up: 3.9, ahead: 18, lookUp: 2.0, lagX: 3.2, lagY: 2.4, fov: 56 },
     title: { az: 2.45, radius: 12.5, up: 0.9, lookUp: 0.3, fov: 46 }
@@ -386,7 +387,7 @@ const createGame = () => {
     const p = { x: 0, y: 0, z: 0, vx: 0, vy: 0, speed: 0, hp: TUNE.hp, inv: 0, boost: 1, boosting: false, slow: 1, alive: true };
     const run = { z0: 0, z1: null, score: 0, near: 0, combo: 0, comboT: 0, sector: 1 }; // z1: where it ended
     const rail = { x: 0, y: 0 };
-    const pose = { lean: TUNE.titleLean * DEG, bank: 0, yaw: 0, sprint: 0, wobble: 0 };
+    const pose = { lean: TUNE.titleLean * DEG, bank: 0, yaw: 0, sprint: 0, wobble: 0, spin: 1, spinDir: 1 };
     const rot = { q: [0, 0, 0, 1] };
     let time = 0;
     let camBlend = 0; // 0: the title view in front of the model, 1: chasing it from behind
@@ -626,6 +627,9 @@ const createGame = () => {
         p.slow = 0.6;
         shake = Math.max(shake, 0.9);
         pose.wobble = 1;
+        // knocked into a full roll, the way the hit threw it
+        pose.spin = 0;
+        pose.spinDir = Math.abs(p.vx) > 1 ? Math.sign(p.vx) : Math.random() < 0.5 ? -1 : 1;
         run.combo = 0;
         hud.hit();
         if (!metal) audio.hit();
@@ -982,10 +986,14 @@ const createGame = () => {
         pose.yaw += (-vxn * TUNE.yaw * DEG - heading - pose.yaw) * k;
         pose.wobble = Math.max(0, pose.wobble - dt * 1.5);
         const wob = pose.wobble * 0.35 * Math.sin(time * 30);
+        // a full roll after a hit: fast at first, settling at the end (a positive angle rolls the top
+        // towards the screen's right, game +x)
+        pose.spin = Math.min(1, pose.spin + dt / TUNE.spinTime);
+        const spun = pose.spin < 1 ? pose.spinDir * Math.PI * 2 * (1 - (1 - pose.spin) ** 3) : 0;
         const bob = (1 - b) * 0.05 * Math.sin(time * 1.3);
         // lean about the model's right axis (top towards +Z, its front), turn, then bank about the
         // direction of flight (+Z): a positive angle tips the top towards -X, the screen's right
-        rot.q = qMul(qAxis(0, 0, 1, pose.bank + wob + bob), qMul(qAxis(0, 1, 0, pose.yaw), qAxis(1, 0, 0, pose.lean)));
+        rot.q = qMul(qAxis(0, 0, 1, pose.bank + wob + bob + spun), qMul(qAxis(0, 1, 0, pose.yaw), qAxis(1, 0, 0, pose.lean)));
         qMat3(rot.q, fx.rotMat);
 
         if (!splat) return;
