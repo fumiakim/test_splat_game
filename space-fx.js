@@ -51,6 +51,7 @@ const CONFIG = {
     flameAngle: 50, // 噴射の向き: 真後ろ（水平）から下へ何度傾けるか
     flameSplay: 0.15, // 左右の炎を外側へ開く量
     flameWidth: 1.0, // 炎の太さ（倍率）
+    flameSize: 1.5, // 炎全体の大きさ（倍率）: 長さ・太さ・ノズルの光の玉をまとめて拡大（ノズルの位置は変わらない）
     nozzleSize: 0.09, // ノズルの直径（ワールド単位）
     // ノズルの位置と面の向き（ワールド座標。ビューアでノズルをダブルクリックして拾った値）
     thrusters: [
@@ -330,7 +331,8 @@ const buildParticles = () => {
         const right = norm([up[1] * back[2] - up[2] * back[1], up[2] * back[0] - up[0] * back[2], up[0] * back[1] - up[1] * back[0]]);
         const mean = [0, 1, 2].map((i) => T.reduce((a, t) => a + t.pos[i], 0) / T.length);
         const tilt = (CONFIG.flameAngle * Math.PI) / 180;
-        const w = CONFIG.nozzleSize * CONFIG.flameWidth;
+        const S = CONFIG.flameSize ?? 1; // the whole flame, scaled about the nozzle
+        const w = CONFIG.nozzleSize * CONFIG.flameWidth * S;
         for (const t of T) {
             const side = Math.sign((t.pos[0] - mean[0]) * right[0] + (t.pos[2] - mean[2]) * right[2]);
             const dir = norm([0, 1, 2].map((i) => back[i] * Math.cos(tilt) - up[i] * Math.sin(tilt) + right[i] * side * CONFIG.flameSplay));
@@ -340,9 +342,9 @@ const buildParticles = () => {
             const flicker = rnd() * TAU;
             const emit = (kind, look, w0, w1, length) =>
                 out.push(...start, ...dir, length, ...inside, flicker, ...look, w0, kind, w1, 0, 0, rnd(), 0, 0);
-            emit(FLAME, [1, 1, 1, 1.2], CONFIG.nozzleSize * 3.2, 0, 0); // glow at the nozzle
-            emit(BEAM, [...FLAME_TAIL, 1.8], w * 1.5, w * 5.5, CONFIG.flameLength); // plume
-            emit(BEAM, [1, 1, 1, 2.2], w * 0.9, w * 1.7, CONFIG.flameLength * 0.5); // white-hot core
+            emit(FLAME, [1, 1, 1, 1.2], CONFIG.nozzleSize * 3.2 * S, 0, 0); // glow at the nozzle
+            emit(BEAM, [...FLAME_TAIL, 1.8], w * 1.5, w * 5.5, CONFIG.flameLength * S); // plume
+            emit(BEAM, [1, 1, 1, 2.2], w * 0.9, w * 1.7, CONFIG.flameLength * 0.5 * S); // white-hot core
         }
     }
 

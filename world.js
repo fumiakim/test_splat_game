@@ -48,6 +48,7 @@ export const TRENCH = {
     depth: 26, // 溝の深さ（床から縁まで）
     floor: -9, // 床の高さ
     ledge: 0.55, // 壁の途中の段の高さ（深さに対する比）。段より上は溝が少し広い
+    gutter: [1.3, 0.8], // 床の両端（壁の足もと）の側溝の幅と深さ
     halfWidth: [9.5, 7.6], // ふだんの溝の幅の半分（開始時 → 最高難度）
     narrow: [5.4, 4.6], // 狭い所の幅の半分
     wind: [0.28, 0.43], // ふだんの曲がりくねりの強さ（カーブの合間）
@@ -107,7 +108,7 @@ export const ROCK_VARIANTS = SHAPE_COUNT + 2; // 岩の形の数＋箱＋機雷�
 // 火花だけ（シールドは減らない）。見た目でかすめただけなのに当たった、を無くす
 export const HIT_TOLERANCE = 0.25;
 export const ROCK_FLOATS = 14; // pos3 scale3 quat4 heat shadow seed -
-export const MAX_ROCKS = 640;
+export const MAX_ROCKS = 900;
 export const SPARK_FLOATS = 8; // pos3 size rgb intensity
 export const MAX_SPARKS = 4000;
 export const MAX_BLOBS = 16;
@@ -436,11 +437,14 @@ export class TrenchTrack {
         const top = [[hu + 70, D], [hu + 22, D], [hu + e, D]];
         for (let k = 0; k < NP; k++) put(-1, top[k][0], top[k][1], 1);
         for (let k = 0; k < NW; k++) put(-1, wall[k][0], wall[k][1], wallAO(wall[k][0], wall[k][1]));
-        for (let k = 1; k <= NF; k++) {
-            const s = k === 1 ? 0.004 : k === NF ? 0.996 : (k - 1) / (NF - 1);
-            const x = lerp(-hw, hw, s);
-            put(1, x, 0, 0.45 + 0.55 * smooth01((hw - Math.abs(x)) / 4));
-        }
+        // the floor: a gutter at the foot of each wall (the walls run down into it), the plated floor
+        // between them (NF points in all)
+        const G = Math.min(TRENCH.gutter[0], hw * 0.2);
+        const gd = TRENCH.gutter[1];
+        const fl = [[-hw, -gd], [-hw + G, -gd], [-hw + G, 0]];
+        for (let k = 0; k < NF - 6; k++) fl.push([lerp(-hw + G + 0.05, hw - G - 0.05, k / (NF - 7)), 0]);
+        fl.push([hw - G, 0], [hw - G, -gd], [hw, -gd]);
+        for (const [x, h] of fl) put(1, x, h, h < 0 ? 0.35 : 0.5 + 0.5 * smooth01((hw - G - Math.abs(x)) / 3));
         for (let k = NW - 1; k >= 0; k--) put(1, wall[k][0], wall[k][1], wallAO(wall[k][0], wall[k][1]));
         for (let k = NP - 1; k >= 0; k--) put(1, top[k][0], top[k][1], 1);
     }
@@ -1187,29 +1191,41 @@ export class World {
     spawnFloorParts(zc) {
         const rnd = this.rnd;
         const tr = this.track;
-        const n = 2 + Math.floor(rnd() * 3);
+        const n = 4 + Math.floor(rnd() * 4);
         for (let i = 0; i < n; i++) {
             const z = zc + rnd() * CHUNK;
-            const hw = tr.halfWidth(z);
-            let hx;
-            let hz;
-            let top;
-            if (rnd() < 0.55) {
+            const room = tr.halfWidth(z) - Math.min(TRENCH.gutter[0], tr.halfWidth(z) * 0.2) - 0.3; // to the gutter's edge
+            // set 0.3 into the floor, standing `top` above it, `across` from the trench's line
+            const part = (across, hx, top, hz, dz = 0) => this.trenchBox('greeble', z + dz, across, (top - 0.3) / 2, hx, (top + 0.3) / 2, hz);
+            const at = (hx) => (rnd() * 2 - 1) * Math.max(0, room - hx);
+            const u = rnd();
+            if (u < 0.28) {
                 // a low block
-                hx = lerp(0.6, 2.2, rnd());
-                hz = lerp(0.6, 2.4, rnd());
-                top = lerp(0.3, 0.8, rnd());
-            } else {
+                const hx = lerp(0.6, 2.2, rnd());
+                part(at(hx), hx, lerp(0.3, 0.8, rnd()), lerp(0.6, 2.4, rnd()));
+            } else if (u < 0.48) {
+                // a broad raised plate
+                const hx = Math.min(lerp(1.5, 3.5, rnd()), room);
+                part(at(hx), hx, lerp(0.15, 0.3, rnd()), lerp(2, 6, rnd()));
+            } else if (u < 0.64) {
                 // a pipe along the floor
-                hx = lerp(0.18, 0.3, rnd());
-                hz = lerp(3, 7, rnd());
-                top = 2 * hx;
+                const hx = lerp(0.18, 0.3, rnd());
+                part(at(hx), hx, 2 * hx, lerp(3, 7, rnd()));
+            } else if (u < 0.8) {
+                // a bundle of two or three pipes side by side
+                const r = lerp(0.15, 0.24, rnd());
+                const k = 2 + (rnd() < 0.5 ? 1 : 0);
+                const x0 = at(k * r * 1.3);
+                const len = lerp(4, 9, rnd());
+                for (let j = 0; j < k; j++) part(x0 + (j - (k - 1) / 2) * r * 2.6, r, 2 * r, len);
+            } else {
+                // a low ridge across most of the floor
+                const hx = room * lerp(0.5, 0.95, rnd());
+                part(at(hx), hx, lerp(0.25, 0.45, rnd()), lerp(0.2, 0.45, rnd()));
             }
-            const across = (rnd() * 2 - 1) * Math.max(0, hw - hx - 0.4);
-            // set 0.3 into the floor, standing `top` above it
-            this.trenchBox('greeble', z, across, (top - 0.3) / 2, hx, (top + 0.3) / 2, hz);
         }
     }
+
 
     // blocks, towers and pipes on the fortress's surface beside the trench (only to look at: the
     // player stays inside the trench), and the walls' and floor's own relief

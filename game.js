@@ -626,8 +626,9 @@ const createGame = () => {
         p.inv = TUNE.inv;
         p.slow = 0.6;
         shake = Math.max(shake, 0.9);
-        pose.wobble = 1;
-        // knocked into a full roll, the way the hit threw it
+        // knocked into a full roll, the way the hit threw it (instead of the old shudder: its shaking
+        // showed through as the roll slowed, so the roll stopped and lurched at the end)
+        pose.wobble = 0;
         pose.spin = 0;
         pose.spinDir = Math.abs(p.vx) > 1 ? Math.sign(p.vx) : Math.random() < 0.5 ? -1 : 1;
         run.combo = 0;

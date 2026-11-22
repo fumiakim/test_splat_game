@@ -19,7 +19,8 @@ import {
     MAX_BLOBS,
     TAIL_FLOATS,
     MAX_TAILS,
-    SUN
+    SUN,
+    TRENCH
 } from './world.js';
 import { getRockShapes, ROCK_VERT_FLOATS } from './rock-shapes.js';
 
@@ -327,6 +328,21 @@ void main() {
             float ribS = 1.0 - smoothstep(0.3, 0.6, rib);
             h += 0.5 * ribS;
             alb *= 1.0 + 0.12 * ribS;
+        }
+        // the trench floor (not the fortress's top): grooves running along it, a grating on one plate
+        // in five (bars across, dark gaps), and deeper relief all round
+        if (level && p.y < ${(TRENCH.floor + 1).toFixed(1)}) {
+            float gx = abs(fract(p.x / 4.6 + 0.5) - 0.5) * 4.6;
+            float grooveF = 1.0 - smoothstep(0.1, 0.28, gx);
+            h -= 0.55 * grooveF;
+            alb *= 1.0 - 0.5 * grooveF;
+            if (hash13(vec3(floor(p.xz / 4.0), 77.0)) > 0.8) {
+                float bar = abs(fract(p.z * 2.6) - 0.5);
+                float gap = smoothstep(0.18, 0.32, bar);
+                h -= 0.3 * gap;
+                alb *= 1.0 - 0.6 * gap;
+            }
+            h *= 1.35;
         }
         vec3 N = bump(N0, p, h, 1.35 * (1.0 - smoothstep(40.0, 150.0, vDepth)));
         alb *= alb;
